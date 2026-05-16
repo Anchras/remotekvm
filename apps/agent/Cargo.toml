@@ -22,7 +22,6 @@ clap = { version = "4", features = ["derive"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSError", "NSString", "NSArray"] }
 objc2-core-foundation = { version = "0.3", features = [
-    "CFCFTypeID",
     "CFBase",
     "CFDictionary",
     "CFString",
@@ -43,16 +42,12 @@ objc2-core-video = { version = "0.3", features = [
 objc2-screen-capture-kit = { version = "0.3", features = [
     "SCStream",
     "SCShareableContent",
-    "SCContentFilter",
 ] }
 objc2-video-toolbox = { version = "0.3", features = [
     "VTCompressionSession",
     "VTCompressionProperties",
     "VTSession",
     "VTErrors",
-    "objc2-core-media",
-    "objc2-core-video",
-    "objc2-core-foundation",
 ] }
 block2 = "0.6"
 dispatch2 = "0.3"

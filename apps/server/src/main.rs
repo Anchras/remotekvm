@@ -1,21 +1,3 @@
-// remotekvm-server
-//
-// SaaS coordination server for RemoteKVM.
-//
-// Responsibilities:
-//   - OAuth2 authentication (Google, GitHub, Microsoft)
-//   - JWT session management
-//   - Machine registration and discovery
-//   - WebRTC signaling relay (WebSocket)
-//   - REST API for dashboard data
-//   - Stripe billing webhooks
-//
-// Phase 0 MVP:
-//   - Health endpoint
-//   - Basic Axum server scaffolding
-//   - WebSocket signaling structure
-//   - Placeholder auth middleware
-
 use anyhow::Result;
 use axum::{
     routing::get,
@@ -23,6 +5,15 @@ use axum::{
 };
 use std::net::SocketAddr;
 use tracing::info;
+
+mod config;
+mod db;
+mod error;
+mod routes;
+mod websocket;
+
+use config::Config;
+use db::Database;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -35,10 +26,19 @@ async fn main() -> Result<()> {
 
     info!("remotekvm-server starting up");
 
-    let app = Router::new()
-        .route("/health", get(health_handler));
+    let config = Config::from_env()?;
+    info!("configuration loaded");
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let db = Database::connect(&config.database_url).await?;
+    info!("database connected");
+
+    // Run migrations
+    db.run_migrations().await?;
+    info!("database migrations applied");
+
+    let app = create_app(db);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -47,6 +47,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn health_handler() -> &'static str {
-    "OK"
+fn create_app(db: Database) -> Router {
+    Router::new()
+        .route("/health", get(routes::health_handler))
+        .with_state(db)
 }
