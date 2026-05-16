@@ -1,0 +1,58 @@
+[package]
+name = "remotekvm-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remotekvm-host"
+path = "src/main.rs"
+
+[dependencies]
+remotekvm-protocol = { workspace = true }
+remotekvm-transport = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSError", "NSString", "NSArray"] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFCFTypeID",
+    "CFBase",
+    "CFDictionary",
+    "CFString",
+    "CFNumber",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase",
+    "CMTime",
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBase",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+] }
+objc2-screen-capture-kit = { version = "0.3", features = [
+    "SCStream",
+    "SCShareableContent",
+    "SCContentFilter",
+] }
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTCompressionSession",
+    "VTCompressionProperties",
+    "VTSession",
+    "VTErrors",
+    "objc2-core-media",
+    "objc2-core-video",
+    "objc2-core-foundation",
+] }
+block2 = "0.6"
+dispatch2 = "0.3"

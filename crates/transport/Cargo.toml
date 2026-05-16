@@ -1,0 +1,15 @@
+[package]
+name = "remotekvm-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+remotekvm-protocol = { workspace = true }
+webrtc = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+bytes = { workspace = true }
