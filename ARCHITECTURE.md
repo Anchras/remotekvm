@@ -15,25 +15,30 @@ All three are written in Rust for consistency, performance, and code sharing.
 ## System Architecture
 
 ```
-┌─────────────────┐         ┌─────────────────────┐         ┌──────────────────┐
-│  Native Client  │  WSS    │   SaaS Coordinator  │  WSS    │   Host Agent     │
-│  (Rust/wgpu)    │◄───────►│   (Auth/Signal/API) │◄───────►│  (Win/macOS)     │
-│  - egui UI      │         │   - PostgreSQL      │         │  - Capture       │
-│  - HW Decode    │  WebRTC │   - Redis           │         │  - HW Encode     │
-│  - Input Fwd    │  (P2P)  │   - OAuth2/JWT      │         │  - Input Inject  │
-└─────────────────┘         └─────────────────────┘         └──────────────────┘
-         │                           │                            │
-         └────────── Tailnet ─────────┴────────────────────────────┘
+┌─────────────────┐   AuthKit/SSO   ┌─────────────┐         ┌──────────────────┐
+│  Native Client  │◄───────────────►│   WorkOS    │   WSS   │   SaaS Server    │
+│  (Rust/wgpu)    │                 │             │◄───────►│   (Axum + sqlx)  │
+│  - egui UI      │                 │             │         │   - Machines     │
+│  - HW Decode    │                 │             │         │   - WebRTC Signal│
+│  - Input Fwd    │                 │             │         │   - Stripe       │
+└─────────────────┘                 └─────────────┘         └────────┬─────────┘
+         │                                                           │  WSS
+         │                              Tailnet                      ▼
+         │    ┌────────────────────────────────────────────────┐  ┌─────────────┐
+         └───►│               P2P WebRTC over Tailscale         │  │ Host Agent  │
+              │         Video/Audio/Input DataChannel           │  │ (Win/macOS) │
+              └────────────────────────────────────────────────┘  └─────────────┘
 ```
 
 ### Network Flow
 
-1. Agent connects outbound to SaaS server via WebSocket (WSS) with a registration token
-2. Client logs in via OAuth2, gets a JWT session
-3. Client connects to SaaS server via WebSocket (WSS) with JWT
-4. Client requests connection to a machine
-5. Server relays WebRTC signaling (SDP offer/answer, ICE candidates) between client and agent
-6. WebRTC data flows directly P2P over Tailscale IPs
+1. **Client** opens browser to WorkOS AuthKit (hosted login UI)
+2. **WorkOS** authenticates user (social, passwordless, or enterprise SSO) and redirects to our server with an authorization code
+3. **Server** exchanges code with WorkOS for user profile, issues its own JWT session
+4. **Agent** connects outbound to SaaS server via WebSocket with a registration token
+5. **Client** connects to SaaS server via WebSocket with JWT
+6. Server relays WebRTC signaling (SDP offer/answer, ICE candidates) between client and agent
+7. WebRTC data flows directly P2P over Tailscale IPs
 
 ---
 
@@ -41,29 +46,52 @@ All three are written in Rust for consistency, performance, and code sharing.
 
 ### SaaS Server (`apps/server`)
 
-**Stack:** Axum, PostgreSQL, Redis, sqlx, tokio
+**Stack:** Axum, PostgreSQL, Redis, sqlx, tokio, WorkOS API
 
 **Responsibilities:**
-- OAuth2 authentication (Google, GitHub, Microsoft)
-- JWT session management
-- User and team management
-- Machine registration and discovery
-- WebRTC signaling relay
-- Stripe billing webhooks
-- REST API for dashboard data
+- **WorkOS integration** — User authentication via AuthKit, multi-tenant organizations
+- **JWT session management** — Own JWTs (24h expiry) + periodic WorkOS validation
+- **Machine registration and discovery** — Agents register, clients discover their machines
+- **WebRTC signaling relay** — SDP offer/answer, ICE candidates
+- **Stripe billing webhooks** — Subscription management
+- **REST API** — Dashboard data (machines, sessions, billing)
 
 **Key APIs:**
-- `POST /auth/callback/{provider}` — OAuth2 callback
-- `GET /api/me` — Current user profile
-- `GET /api/machines` — List user's machines
+- `POST /auth/workos/callback` — WorkOS AuthKit callback, exchanges code for JWT
+- `GET /api/me` — Current user + WorkOS organizations
+- `GET /api/machines` — List user's/organization's machines
 - `POST /api/machines/{id}/connect` — Request connection
-- `GET /api/teams` — List user's teams
-- `POST /api/teams` — Create team
+- `GET /api/billing/subscription` — Subscription details
+- `POST /api/billing/checkout` — Stripe Checkout session
+
+**What WorkOS Handles (we do NOT build):**
+- OAuth2 provider integrations (Google, Microsoft, GitHub, etc.)
+- Organization (team) creation and member management
+- Role-based access control (RBAC)
+- Enterprise SSO (SAML) configuration — via WorkOS Admin Portal
+- Directory Sync (SCIM) — post-MVP
+- Admin Portal for IT self-service — post-MVP
 
 **WebSocket Protocol:**
 - Agents: `wss://server/agent` with `Authorization: Bearer <registration_token>`
 - Clients: `wss://server/client` with `Authorization: Bearer <jwt_session>`
 - Message types: `Hello`, `MachineList`, `ConnectRequest`, `SignalingOffer`, `SignalingAnswer`, `IceCandidate`, `Heartbeat`
+
+### WorkOS
+
+**Products Used in MVP:**
+- **AuthKit** — Hosted login UI with social login, passwordless, MFA
+- **Organizations** — Multi-tenant auth, org membership, role-based access
+
+**Products Used Post-MVP:**
+- **SSO** — SAML/OIDC enterprise authentication (Okta, Azure AD, etc.)
+- **Admin Portal** — IT self-service SSO configuration
+- **Directory Sync (SCIM)** — Automatic user provisioning from identity providers
+
+**Data Sync Strategy:**
+- Our `users` and `organizations` tables are a mirror of WorkOS data
+- Sync on login (upsert user + orgs from WorkOS profile)
+- For MVP: sync-on-login is sufficient; webhooks for live sync post-MVP
 
 ### Agent (`apps/agent`)
 
@@ -116,8 +144,8 @@ On macOS, the agent runs as a `launchd` background job (single process):
 **Stack:** Rust, winit, wgpu, egui, webrtc-rs, cpal
 
 **Responsibilities:**
-- OAuth2 login flow
-- Machine dashboard (list of user's machines with online status)
+- WorkOS AuthKit login flow (opens browser, receives callback)
+- Machine dashboard (list of user's/org's machines with online status)
 - WebRTC connection establishment
 - Hardware video decode
 - YUV→RGB rendering via wgpu
@@ -125,13 +153,28 @@ On macOS, the agent runs as a `launchd` background job (single process):
 - Input capture and forwarding
 
 **UI Flow:**
-1. Login screen (OAuth2 provider selection)
+1. Login screen (opens WorkOS AuthKit in browser)
 2. Dashboard (grid/list of machines, online/offline status)
 3. Connection view (video stream + input capture)
 
 ---
 
 ## Data Flow
+
+### Authentication Flow
+
+```
+Client:
+  Open browser → WorkOS AuthKit URL (with our redirect_uri)
+    → User authenticates (Google/Microsoft/Passwordless)
+      → WorkOS redirects to our server with code
+        → Server: exchange code with WorkOS API
+          → WorkOS returns user profile + organizations
+            → Server upserts user + orgs in PostgreSQL
+              → Server issues JWT session token
+                → Redirect back to client (deep link: remotekvm://auth?token=...)
+                  → Client stores JWT for API access
+```
 
 ### Screen Capture → Encode → Stream
 
@@ -194,12 +237,15 @@ WebRTC transport wrapper:
 
 ## Database Schema
 
-### Users
+### Users (Mirror of WorkOS)
+
 ```sql
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workos_user_id TEXT UNIQUE NOT NULL,
     email TEXT UNIQUE NOT NULL,
-    name TEXT,
+    first_name TEXT,
+    last_name TEXT,
     avatar_url TEXT,
     stripe_customer_id TEXT,
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -207,52 +253,44 @@ CREATE TABLE users (
 );
 ```
 
-### OAuth Accounts
-```sql
-CREATE TABLE oauth_accounts (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL, -- 'google', 'github', 'microsoft'
-    provider_user_id TEXT NOT NULL,
-    UNIQUE(provider, provider_user_id)
-);
-```
+### Organizations (Mirror of WorkOS)
 
-### Teams
 ```sql
-CREATE TABLE teams (
+CREATE TABLE organizations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workos_org_id TEXT UNIQUE NOT NULL,
     name TEXT NOT NULL,
     slug TEXT UNIQUE NOT NULL,
-    owner_id UUID NOT NULL REFERENCES users(id),
     stripe_subscription_id TEXT,
-    plan TEXT NOT NULL DEFAULT 'free', -- 'free', 'pro', 'enterprise'
+    plan TEXT NOT NULL DEFAULT 'free',
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 ```
 
-### Team Members
+### Organization Members (Mirror of WorkOS)
+
 ```sql
-CREATE TABLE team_members (
+CREATE TABLE organization_members (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    role TEXT NOT NULL DEFAULT 'member', -- 'owner', 'admin', 'member'
+    role TEXT NOT NULL DEFAULT 'member',
     joined_at TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE(team_id, user_id)
+    UNIQUE(organization_id, user_id)
 );
 ```
 
 ### Machines
+
 ```sql
 CREATE TABLE machines (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    team_id UUID REFERENCES teams(id) ON DELETE SET NULL,
+    organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     hostname TEXT NOT NULL,
     tailscale_ip INET,
-    platform TEXT NOT NULL, -- 'windows', 'macos', 'linux'
+    platform TEXT NOT NULL,
     registration_token_hash TEXT NOT NULL,
     online BOOLEAN NOT NULL DEFAULT FALSE,
     last_seen TIMESTAMPTZ,
@@ -261,6 +299,7 @@ CREATE TABLE machines (
 ```
 
 ### Sessions
+
 ```sql
 CREATE TABLE sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -268,20 +307,25 @@ CREATE TABLE sessions (
     machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
     started_at TIMESTAMPTZ DEFAULT NOW(),
     ended_at TIMESTAMPTZ,
-    status TEXT NOT NULL DEFAULT 'active' -- 'active', 'ended', 'error'
+    status TEXT NOT NULL DEFAULT 'active'
 );
 ```
+
+**Dropped from previous design:**
+- `oauth_accounts` — WorkOS handles all OAuth provider integrations
+- `teams` / `team_members` — Replaced by `organizations` / `organization_members` (WorkOS-managed)
 
 ---
 
 ## Security Considerations
 
 1. **Agent authentication**: Registration tokens (hashed in DB) used for initial agent connection
-2. **Client authentication**: OAuth2 + JWT sessions with short expiry
+2. **Client authentication**: WorkOS AuthKit + our own JWT sessions with short expiry
 3. **WebRTC security**: DTLS-SRTP for encryption in transit; P2P over Tailscale adds another layer
 4. **Tailscale**: Leverages WireGuard for network-level encryption
 5. **Input injection**: Agent only accepts input from authenticated, active WebRTC sessions
 6. **Screen capture**: Requires OS-level permissions; agent must handle permission denial gracefully
+7. **WorkOS API key**: Stored securely (environment variable only, never in code); server-side only
 
 ---
 

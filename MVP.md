@@ -7,7 +7,7 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 - Windows agents that run as a service and stream the desktop
 - A native client app that can log in and connect to remote machines
 - Audio passthrough
-- Multi-tenant support (B2B teams + B2C individuals)
+- Multi-tenant support (B2B organizations + B2C individuals) via WorkOS
 - Stripe billing
 
 **What the MVP is NOT:**
@@ -21,10 +21,10 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 ## Use Cases
 
 ### B2C: Individual Developer
-> Sarah has a powerful workstation at home and a laptop for travel. She installs the RemoteKVM agent on her workstation, logs into the client on her laptop, and gets full remote access with audio for coding and meetings.
+> Sarah has a powerful workstation at home and a laptop for travel. She installs the RemoteKVM agent on her workstation, logs into the client via WorkOS AuthKit, and gets full remote access with audio for coding and meetings.
 
 ### B2B: Distributed Team
-> Acme Corp has 50 engineers with high-end workstations in the office. They create a RemoteKVM team, invite all engineers, and everyone can remotely access their office machine from home with full audio and low-latency video.
+> Acme Corp has 50 engineers with high-end workstations in the office. They sign up via WorkOS Organizations, invite all engineers, and everyone can remotely access their office machine from home with full audio and low-latency video. Acme's IT admin can later add SSO via the WorkOS Admin Portal.
 
 ---
 
@@ -34,16 +34,24 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| S1 | Support OAuth2 login via Google, GitHub, and Microsoft | P0 |
-| S2 | Issue JWT sessions with 24h expiry | P0 |
-| S3 | Allow agents to register with a machine token | P0 |
-| S4 | Relay WebRTC signaling (SDP + ICE) between client and agent | P0 |
-| S5 | Track machine online/offline status via heartbeats | P0 |
-| S6 | REST API for machine listing and connection requests | P0 |
-| S7 | Support team creation and member invites | P1 |
-| S8 | Stripe Checkout for subscription management | P1 |
-| S9 | Handle Stripe webhooks for subscription events | P1 |
-| S10 | Usage tracking (connection minutes) for billing | P2 |
+| S1 | WorkOS AuthKit integration — hosted login UI | P0 |
+| S2 | Issue own JWT sessions (24h expiry) after WorkOS authentication | P0 |
+| S3 | Sync WorkOS user + organization data to PostgreSQL on login | P0 |
+| S4 | Allow agents to register with a machine token | P0 |
+| S5 | Relay WebRTC signaling (SDP + ICE) between client and agent | P0 |
+| S6 | Track machine online/offline status via heartbeats | P0 |
+| S7 | REST API for machine listing and connection requests | P0 |
+| S8 | Support WorkOS Organizations (multi-tenancy) | P1 |
+| S9 | Stripe Checkout for subscription management | P1 |
+| S10 | Handle Stripe webhooks for subscription events | P1 |
+| S11 | Usage tracking (connection minutes) for billing | P2 |
+
+**What WorkOS handles (we do NOT build):**
+- OAuth2 provider integrations (Google, Microsoft, GitHub, etc.) — AuthKit
+- Organization creation and member invites — Organizations API
+- User roles and permissions — Organizations API
+- Enterprise SSO (SAML) — SSO product (post-MVP)
+- Directory Sync (SCIM) — Directory Sync product (post-MVP)
 
 ### Agent (Windows)
 
@@ -66,7 +74,7 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 | ID | Requirement | Priority |
 |----|-------------|----------|
 | C1 | Native desktop app (Windows and macOS) | P0 |
-| C2 | OAuth2 login screen | P0 |
+| C2 | WorkOS AuthKit login flow (opens browser, deep link callback) | P0 |
 | C3 | Dashboard showing user's machines with online status | P0 |
 | C4 | Click-to-connect flow | P0 |
 | C5 | Hardware video decode (Media Foundation on Win, VideoToolbox on macOS) | P0 |
@@ -107,6 +115,9 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 - Session recording
 - Administrative dashboard
 - On-premise deployment
+- Enterprise SSO (SAML) — WorkOS SSO product
+- Directory Sync (SCIM) — WorkOS Directory Sync
+- WorkOS Admin Portal — available but not integrated into our UI
 - Load balancing / horizontal scaling of signaling server
 - Automatic failover / high availability
 
@@ -115,13 +126,13 @@ The Minimum Viable Product is a **functioning remote desktop SaaS** with:
 ## Acceptance Criteria
 
 A user can:
-1. Sign up via OAuth2 on the client app
+1. Log in via WorkOS AuthKit on the client app (social login or passwordless)
 2. Install the agent on their Windows machine
 3. See their machine appear online in the client dashboard
 4. Click "Connect" and see their remote desktop with audio within 5 seconds
 5. Use mouse and keyboard as if locally connected
 6. Disconnect and reconnect without issues
-7. Invite team members (B2B) and share machine access
+7. Belong to a WorkOS organization (B2B) and share machine access within the org
 8. Subscribe to a paid plan via Stripe
 
 ---
@@ -132,6 +143,8 @@ A user can:
 |----------|-----------|
 | Rust end-to-end | Consistency, performance, shared crates |
 | Axum for server | Best async Rust HTTP framework |
+| WorkOS for auth | AuthKit handles OAuth, MFA, passwordless; Organizations handles multi-tenancy |
+| Own JWTs + WorkOS | Fast local validation (JWT) + WorkOS as source of truth |
 | wgpu + egui for client | Full control over video render, cross-platform |
 | NVENC primary encode | Lowest latency, best quality for workstations |
 | Tailscale for networking | Zero-config mesh, built-in encryption, no TURN needed |
@@ -140,6 +153,7 @@ A user can:
 | WebRTC for transport | Standard P2P, NAT traversal, DTLS-SRTP encryption |
 | PostgreSQL for data | Robust, well-supported, sqlx for type safety |
 | Redis for sessions | Fast ephemeral state, signaling pub/sub |
+| Stripe for billing | Industry standard, well-documented Rust SDK |
 
 ---
 

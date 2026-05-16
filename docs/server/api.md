@@ -2,11 +2,13 @@
 
 ## Authentication
 
-All API requests (except OAuth callbacks) require a Bearer JWT token in the `Authorization` header:
+All API requests (except the WorkOS callback) require a Bearer JWT token in the `Authorization` header:
 
 ```
 Authorization: Bearer <jwt_token>
 ```
+
+The JWT is issued by our server after successful WorkOS AuthKit authentication.
 
 ## Endpoints
 
@@ -25,27 +27,19 @@ Returns server health status.
 }
 ```
 
-### Authentication
+### Authentication (WorkOS AuthKit)
 
-#### `GET /auth/{provider}/start`
+The client initiates login by opening WorkOS AuthKit in a browser:
 
-Initiates OAuth2 flow with the given provider.
-
-**Providers:** `google`, `github`, `microsoft`
-
-**Query Parameters:**
-- `redirect_uri` (optional) — Where to redirect after auth
-
-**Response:**
-```json
-{
-  "authorization_url": "https://accounts.google.com/o/oauth2/v2/auth?..."
-}
+```
+https://auth.workos.com/authenticate?client_id=<workos_client_id>&redirect_uri=<our_callback>&response_type=code&...`
 ```
 
-#### `GET /auth/{provider}/callback?code=...&state=...`
+After authentication, WorkOS redirects to our callback endpoint.
 
-OAuth2 callback endpoint. Exchanges code for token, creates or updates user.
+#### `GET /auth/workos/callback?code=...`
+
+WorkOS AuthKit callback endpoint. Exchanges code for profile via WorkOS API, creates/updates user and organizations, issues JWT session.
 
 **Response:**
 ```json
@@ -53,32 +47,51 @@ OAuth2 callback endpoint. Exchanges code for token, creates or updates user.
   "token": "<jwt_token>",
   "user": {
     "id": "uuid",
+    "workos_user_id": "user_xxxxxxxx",
     "email": "user@example.com",
-    "name": "User Name",
-    "avatar_url": "https://..."
+    "first_name": "User",
+    "last_name": "Name",
+    "avatar_url": "https://...",
+    "organizations": [
+      {
+        "id": "uuid",
+        "workos_org_id": "org_xxxxxxxx",
+        "name": "Acme Corp",
+        "slug": "acme-corp",
+        "role": "member"
+      }
+    ]
   }
 }
 ```
+
+**Error Responses:**
+- `400` — Missing or invalid code
+- `401` — WorkOS code exchange failed
+- `500` — Internal error during profile sync
 
 ### User
 
 #### `GET /api/me`
 
-Returns the current authenticated user.
+Returns the current authenticated user with WorkOS organizations.
 
 **Response:**
 ```json
 {
   "id": "uuid",
+  "workos_user_id": "user_xxxxxxxx",
   "email": "user@example.com",
-  "name": "User Name",
+  "first_name": "User",
+  "last_name": "Name",
   "avatar_url": "https://...",
-  "teams": [
+  "organizations": [
     {
       "id": "uuid",
+      "workos_org_id": "org_xxxxxxxx",
       "name": "Acme Corp",
       "slug": "acme-corp",
-      "role": "owner"
+      "role": "member"
     }
   ]
 }
@@ -88,7 +101,9 @@ Returns the current authenticated user.
 
 #### `GET /api/machines`
 
-List all machines accessible to the current user (owned + team shared).
+List all machines accessible to the current user:
+- Personal machines (where `user_id` matches)
+- Organization machines (where `organization_id` matches user's orgs)
 
 **Response:**
 ```json
@@ -106,7 +121,7 @@ List all machines accessible to the current user (owned + team shared).
         "id": "uuid",
         "name": "User Name"
       },
-      "team": {
+      "organization": {
         "id": "uuid",
         "name": "Acme Corp"
       }
@@ -157,47 +172,45 @@ Request a connection to a machine. The server will forward this to the agent.
 
 Delete a machine registration.
 
-### Teams
+### Organizations
 
-#### `GET /api/teams`
+**Note:** Organization CRUD is managed by WorkOS. Our server mirrors the data.
 
-List teams the user is a member of.
+#### `GET /api/organizations`
 
-#### `POST /api/teams`
+List organizations the user is a member of (from our DB mirror of WorkOS).
 
-Create a new team.
-
-**Request:**
+**Response:**
 ```json
 {
-  "name": "Acme Corp"
+  "organizations": [
+    {
+      "id": "uuid",
+      "workos_org_id": "org_xxxxxxxx",
+      "name": "Acme Corp",
+      "slug": "acme-corp",
+      "role": "member",
+      "plan": "pro"
+    }
+  ]
 }
 ```
 
-#### `GET /api/teams/{id}`
+#### `GET /api/organizations/{id}/members`
 
-Get team details.
+List members of an organization.
 
-#### `POST /api/teams/{id}/invite`
-
-Invite a user to the team by email.
-
-**Request:**
+**Response:**
 ```json
 {
-  "email": "colleague@example.com",
-  "role": "member"
-}
-```
-
-#### `POST /api/teams/{id}/members/{user_id}/role`
-
-Update a member's role.
-
-**Request:**
-```json
-{
-  "role": "admin"
+  "members": [
+    {
+      "user_id": "uuid",
+      "email": "member@example.com",
+      "name": "Member Name",
+      "role": "admin"
+    }
+  ]
 }
 ```
 
@@ -242,6 +255,10 @@ Create a Stripe Customer Portal session.
 #### `POST /webhooks/stripe`
 
 Stripe webhook endpoint.
+
+#### `POST /webhooks/workos` (Post-MVP)
+
+WorkOS webhooks for live sync of user/org changes.
 
 ---
 
@@ -398,7 +415,6 @@ All errors follow this format:
     "code": "MACHINE_NOT_FOUND",
     "message": "Machine with id 'uuid' not found"
   }
-}
 }
 ```
 
