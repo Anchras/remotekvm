@@ -77,6 +77,7 @@ pub struct AppState {
     pub db: Database,
     pub workos: WorkOsClient,
     pub config: Config,
+    pub signaling: crate::websocket::SignalingState,
 }
 
 #[derive(Debug, Deserialize)]

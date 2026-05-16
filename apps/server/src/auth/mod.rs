@@ -2,11 +2,12 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod middleware;
 pub mod routes;
 pub mod workos;
 
 /// JWT claims for our own session tokens.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,       // user UUID
     pub workos_user_id: String,

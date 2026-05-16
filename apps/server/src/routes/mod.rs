@@ -1,6 +1,10 @@
 use axum::Json;
 use serde_json::Value;
 
+pub mod machines;
+pub mod me;
+pub mod sessions;
+
 pub async fn health_handler() -> Json<Value> {
     Json(serde_json::json!({
         "status": "ok",

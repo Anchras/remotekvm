@@ -25,6 +25,8 @@ chrono = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
+ipnetwork = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }

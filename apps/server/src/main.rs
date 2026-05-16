@@ -1,6 +1,7 @@
 use anyhow::Result;
 use axum::{
-    routing::get,
+    middleware,
+    routing::{delete, get, post},
     Router,
 };
 use std::net::SocketAddr;
@@ -14,6 +15,7 @@ mod error;
 mod routes;
 mod websocket;
 
+use auth::middleware::jwt_auth_middleware;
 use auth::routes::AppState;
 use auth::workos::WorkOsClient;
 use config::Config;
@@ -36,7 +38,6 @@ async fn main() -> Result<()> {
     let db = Database::connect(&config.database_url).await?;
     info!("database connected");
 
-    // Run migrations
     db.run_migrations().await?;
     info!("database migrations applied");
 
@@ -46,10 +47,13 @@ async fn main() -> Result<()> {
     );
     info!("workos client initialized");
 
+    let signaling = websocket::SignalingState::new();
+
     let state = Arc::new(AppState {
         db,
         workos,
         config,
+        signaling,
     });
 
     let app = create_app(Arc::clone(&state));
@@ -64,8 +68,31 @@ async fn main() -> Result<()> {
 }
 
 fn create_app(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Public routes (no auth required)
+    let public_routes = Router::new()
         .route("/health", get(routes::health_handler))
-        .route("/auth/workos/callback", get(auth::routes::workos_callback))
+        .route("/auth/workos/callback", get(auth::routes::workos_callback));
+
+    // Protected API routes (JWT auth required)
+    let api_routes = Router::new()
+        .route("/api/me", get(routes::me::me_handler))
+        .route("/api/machines", get(routes::machines::list_machines))
+        .route("/api/machines", post(routes::machines::register_machine))
+        .route("/api/machines/:id", get(routes::machines::get_machine))
+        .route("/api/machines/:id", delete(routes::machines::delete_machine))
+        .route("/api/machines/:id/connect", post(routes::sessions::connect_machine))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            jwt_auth_middleware,
+        ));
+
+    // WebSocket routes
+    let ws_routes = Router::new()
+        .route("/agent", get(websocket::agent_ws_handler))
+        .route("/client", get(websocket::client_ws_handler));
+
+    public_routes
+        .merge(api_routes)
+        .merge(ws_routes)
         .with_state(state)
 }
