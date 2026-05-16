@@ -1,7 +1,10 @@
-// remotekvm-host
+// remotekvm-agent
 //
 // v0 dev driver: capture + encode only, dump raw HEVC annex-B to a file.
 // Validate with: `ffplay -f hevc out.h265` (or `ffmpeg -i out.h265 out.mp4`).
+//
+// Future: Windows service + session agent architecture for SaaS.
+// Current: macOS-only capture pipeline for development and testing.
 
 use anyhow::Result;
 use clap::Parser;

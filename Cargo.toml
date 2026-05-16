@@ -3,8 +3,9 @@ resolver = "2"
 members = [
     "crates/protocol",
     "crates/transport",
-    "apps/host",
+    "apps/agent",
     "apps/client",
+    "apps/server",
 ]
 
 [workspace.package]

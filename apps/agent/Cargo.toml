@@ -1,11 +1,11 @@
 [package]
-name = "remotekvm-host"
+name = "remotekvm-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "remotekvm-host"
+name = "remotekvm-agent"
 path = "src/main.rs"
 
 [dependencies]

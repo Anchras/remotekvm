@@ -1,0 +1,21 @@
+[package]
+name = "remotekvm-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remotekvm-server"
+path = "src/main.rs"
+
+[dependencies]
+remotekvm-protocol = { workspace = true }
+remotekvm-transport = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
