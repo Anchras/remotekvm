@@ -4,14 +4,18 @@ use axum::{
     Router,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tracing::info;
 
+mod auth;
 mod config;
 mod db;
 mod error;
 mod routes;
 mod websocket;
 
+use auth::routes::AppState;
+use auth::workos::WorkOsClient;
 use config::Config;
 use db::Database;
 
@@ -36,9 +40,21 @@ async fn main() -> Result<()> {
     db.run_migrations().await?;
     info!("database migrations applied");
 
-    let app = create_app(db);
+    let workos = WorkOsClient::new(
+        config.workos_api_key.clone(),
+        config.workos_client_id.clone(),
+    );
+    info!("workos client initialized");
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
+    let state = Arc::new(AppState {
+        db,
+        workos,
+        config,
+    });
+
+    let app = create_app(Arc::clone(&state));
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], state.config.port));
     info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -47,8 +63,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn create_app(db: Database) -> Router {
+fn create_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(routes::health_handler))
-        .with_state(db)
+        .route("/auth/workos/callback", get(auth::routes::workos_callback))
+        .with_state(state)
 }
