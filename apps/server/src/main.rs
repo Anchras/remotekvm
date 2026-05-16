@@ -13,13 +13,15 @@ mod config;
 mod db;
 mod error;
 mod routes;
+mod state;
+mod util;
 mod websocket;
 
 use auth::middleware::jwt_auth_middleware;
-use auth::routes::AppState;
 use auth::workos::WorkOsClient;
 use config::Config;
 use db::Database;
+use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,12 +64,31 @@ async fn main() -> Result<()> {
     info!("listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
 
+    // Graceful shutdown on SIGTERM / SIGINT
+    let shutdown = async {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler");
+        let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to install SIGINT handler");
+
+        tokio::select! {
+            _ = term.recv() => info!("SIGTERM received, starting graceful shutdown"),
+            _ = int.recv() => info!("SIGINT received, starting graceful shutdown"),
+        }
+    };
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
+
+    info!("server shut down gracefully");
     Ok(())
 }
 
 fn create_app(state: Arc<AppState>) -> Router {
+    use tower_http::trace::TraceLayer;
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/health", get(routes::health_handler))
@@ -80,6 +101,7 @@ fn create_app(state: Arc<AppState>) -> Router {
         .route("/api/machines", post(routes::machines::register_machine))
         .route("/api/machines/:id", get(routes::machines::get_machine))
         .route("/api/machines/:id", delete(routes::machines::delete_machine))
+        .route("/api/machines/:id/rotate-token", post(routes::machines::rotate_token))
         .route("/api/machines/:id/connect", post(routes::sessions::connect_machine))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
@@ -94,5 +116,6 @@ fn create_app(state: Arc<AppState>) -> Router {
     public_routes
         .merge(api_routes)
         .merge(ws_routes)
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

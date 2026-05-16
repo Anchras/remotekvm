@@ -2,12 +2,12 @@ use axum::{
     extract::{Extension, Path, State},
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 
 use crate::auth::Claims;
-use crate::auth::routes::AppState;
 use crate::error::ApiError;
+use crate::state::AppState;
 
 /// POST /api/machines/{id}/connect — Request a connection to a machine.
 pub async fn connect_machine(
@@ -15,8 +15,7 @@ pub async fn connect_machine(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ConnectResponse>, ApiError> {
-    let user_id = uuid::Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?;
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Verify machine exists and user has access
     let machine = sqlx::query_as::<_, MachineStatusRow>(

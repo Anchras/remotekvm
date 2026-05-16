@@ -1,5 +1,5 @@
 use axum::{
-    extract::{ws::{Message, WebSocket}, State, WebSocketUpgrade},
+    extract::{ws::{Message, WebSocket}, Query, State, WebSocketUpgrade},
     response::Response,
 };
 use serde::{Deserialize, Serialize};
@@ -9,16 +9,19 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::auth::routes::AppState;
 use crate::auth::validate_token;
+use crate::state::AppState;
+use crate::error::ApiError;
+
+const WS_CHANNEL_SIZE: usize = 64;
 
 /// Shared state for WebSocket connections.
 #[derive(Default, Clone)]
 pub struct SignalingState {
     /// Map of machine_id -> agent WebSocket sender
-    agents: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<SignalingMessage>>>>,
+    agents: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<SignalingMessage>>>>,
     /// Map of session_id -> client WebSocket sender
-    clients: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<SignalingMessage>>>>,
+    clients: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<SignalingMessage>>>>,
 }
 
 impl SignalingState {
@@ -50,46 +53,46 @@ pub enum SignalingMessage {
 
 // --- Agent WebSocket ---
 
+#[derive(Debug, Deserialize)]
+pub struct AgentTokenQuery {
+    pub token: String,
+}
+
 pub async fn agent_ws_handler(
     ws: WebSocketUpgrade,
+    Query(query): Query<AgentTokenQuery>,
     State(state): State<Arc<AppState>>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_agent_socket(socket, state))
+) -> Result<Response, ApiError> {
+    // Validate registration token *before* upgrading the connection
+    let machine_id = validate_agent_token(&query.token, &state).await
+        .ok_or_else(|| ApiError::Unauthorized)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_agent_socket(socket, state, machine_id)))
 }
 
 async fn handle_agent_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
+    machine_id: uuid::Uuid,
 ) {
-    info!("agent websocket connected");
-
-    // First message must be the registration token
-    let machine_id = match authenticate_agent(&mut socket, &state).await {
-        Some(id) => id,
-        None => {
-            warn!("agent authentication failed");
-            return;
-        }
-    };
-
-    info!(machine_id = %machine_id, "agent authenticated");
+    info!(machine_id = %machine_id, "agent websocket connected");
 
     // Mark machine as online
     if let Err(e) = sqlx::query(
         "UPDATE machines SET online = true, last_seen = NOW() WHERE id = $1"
     )
-    .bind(uuid::Uuid::parse_str(&machine_id).unwrap_or_default())
+    .bind(machine_id)
     .execute(state.db.pool())
     .await
     {
         error!(error = %e, "failed to mark machine as online");
     }
 
-    // Create a channel for forwarding messages to this agent
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SignalingMessage>();
+    // Create a bounded channel for forwarding messages to this agent
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<SignalingMessage>(WS_CHANNEL_SIZE);
     {
         let mut agents = state.signaling.agents.write().await;
-        agents.insert(machine_id.clone(), tx);
+        agents.insert(machine_id.to_string(), tx);
     }
 
     // Main loop: read from socket and from the forward channel
@@ -98,7 +101,7 @@ async fn handle_agent_socket(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_agent_message(&text, &machine_id, &state).await {
+                        if let Err(e) = handle_agent_message(&text, &machine_id.to_string(), &state).await {
                             warn!(error = %e, "failed to handle agent message");
                         }
                     }
@@ -116,7 +119,13 @@ async fn handle_agent_socket(
             msg = rx.recv() => {
                 match msg {
                     Some(signaling_msg) => {
-                        let json = serde_json::to_string(&signaling_msg).unwrap_or_default();
+                        let json = match serde_json::to_string(&signaling_msg) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                error!(error = %e, "failed to serialize signaling message");
+                                continue;
+                            }
+                        };
                         if let Err(e) = socket.send(Message::Text(json)).await {
                             error!(error = %e, "failed to send to agent");
                             break;
@@ -131,13 +140,13 @@ async fn handle_agent_socket(
     // Cleanup: mark offline and remove from agents map
     {
         let mut agents = state.signaling.agents.write().await;
-        agents.remove(&machine_id);
+        agents.remove(&machine_id.to_string());
     }
 
     if let Err(e) = sqlx::query(
         "UPDATE machines SET online = false WHERE id = $1"
     )
-    .bind(uuid::Uuid::parse_str(&machine_id).unwrap_or_default())
+    .bind(machine_id)
     .execute(state.db.pool())
     .await
     {
@@ -147,23 +156,8 @@ async fn handle_agent_socket(
     info!(machine_id = %machine_id, "agent disconnected");
 }
 
-async fn authenticate_agent(socket: &mut WebSocket, state: &AppState) -> Option<String> {
-    // Wait for the first message (should be the registration token)
-    let token_msg = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
-        socket.recv()
-    ).await.ok()??;
-
-    let token = match token_msg {
-        Ok(Message::Text(text)) => text.trim().to_string(),
-        _ => return None,
-    };
-
-    // Hash the token and look it up in the database
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    let token_hash = format!("{:x}", hasher.finalize());
+async fn validate_agent_token(token: &str, state: &AppState) -> Option<uuid::Uuid> {
+    let token_hash = crate::util::hash_token(token);
 
     let result = sqlx::query_as::<_, MachineIdRow>(
         "SELECT id FROM machines WHERE registration_token_hash = $1"
@@ -173,14 +167,14 @@ async fn authenticate_agent(socket: &mut WebSocket, state: &AppState) -> Option<
     .await;
 
     match result {
-        Ok(Some(row)) => Some(row.id.to_string()),
+        Ok(Some(row)) => Some(row.id),
         _ => None,
     }
 }
 
 async fn handle_agent_message(
     text: &str,
-    machine_id: &str,
+    _machine_id: &str,
     state: &AppState,
 ) -> anyhow::Result<()> {
     let msg: SignalingMessage = serde_json::from_str(text)?;
@@ -194,15 +188,19 @@ async fn handle_agent_message(
                     session_id: session_id.clone(),
                     status: "accepted".to_string(),
                     answer: Some(answer),
-                });
+                }).await;
             }
         }
         SignalingMessage::IceCandidate { session_id, candidate } => {
             // Forward ICE candidate to the client
             let clients = state.signaling.clients.read().await;
             if let Some(client_tx) = clients.get(&session_id) {
-                let _ = client_tx.send(SignalingMessage::IceCandidate { session_id, candidate });
+                let _ = client_tx.send(SignalingMessage::IceCandidate { session_id, candidate }).await;
             }
+        }
+        SignalingMessage::Heartbeat => {
+            // Heartbeat received, agent is alive
+            info!("agent heartbeat");
         }
         _ => {
             info!("agent message: {:?}", msg);
@@ -214,32 +212,35 @@ async fn handle_agent_message(
 
 // --- Client WebSocket ---
 
+#[derive(Debug, Deserialize)]
+pub struct ClientTokenQuery {
+    pub token: String,
+}
+
 pub async fn client_ws_handler(
     ws: WebSocketUpgrade,
+    Query(query): Query<ClientTokenQuery>,
     State(state): State<Arc<AppState>>,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_client_socket(socket, state))
+) -> Result<Response, ApiError> {
+    // Validate JWT *before* upgrading the connection
+    let claims = validate_token(&query.token, &state.config.jwt_secret)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    Ok(ws.on_upgrade(move |socket| handle_client_socket(socket, state, claims.sub)))
 }
 
 async fn handle_client_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
+    user_id: String,
 ) {
-    info!("client websocket connected");
+    info!(user_id = %user_id, "client websocket connected");
 
-    // First message must be the JWT token
-    let user_id = match authenticate_client(&mut socket, &state).await {
-        Some(id) => id,
-        None => {
-            warn!("client authentication failed");
-            return;
-        }
-    };
+    // Create a bounded channel for forwarding messages to this client
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<SignalingMessage>(WS_CHANNEL_SIZE);
 
-    info!(user_id = %user_id, "client authenticated");
-
-    // Create a channel for forwarding messages to this client
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SignalingMessage>();
+    // Track which sessions this client owns for cleanup
+    let mut owned_sessions: Vec<String> = Vec::new();
 
     // Main loop
     loop {
@@ -248,7 +249,7 @@ async fn handle_client_socket(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Err(e) = handle_client_message(
-                            &text, &user_id, &state, &tx
+                            &text, &user_id, &state, &tx, &mut owned_sessions
                         ).await {
                             warn!(error = %e, "failed to handle client message");
                         }
@@ -267,7 +268,13 @@ async fn handle_client_socket(
             msg = rx.recv() => {
                 match msg {
                     Some(signaling_msg) => {
-                        let json = serde_json::to_string(&signaling_msg).unwrap_or_default();
+                        let json = match serde_json::to_string(&signaling_msg) {
+                            Ok(j) => j,
+                            Err(e) => {
+                                error!(error = %e, "failed to serialize signaling message");
+                                continue;
+                            }
+                        };
                         if let Err(e) = socket.send(Message::Text(json)).await {
                             error!(error = %e, "failed to send to client");
                             break;
@@ -279,110 +286,101 @@ async fn handle_client_socket(
         }
     }
 
-    // Cleanup: remove from clients map
+    // Cleanup: remove only this client's owned sessions
     {
         let mut clients = state.signaling.clients.write().await;
-        clients.retain(|_, client_tx| !client_tx.is_closed());
+        for session_id in owned_sessions {
+            clients.remove(&session_id);
+        }
     }
 
     info!(user_id = %user_id, "client disconnected");
 }
 
-async fn authenticate_client(socket: &mut WebSocket, state: &AppState) -> Option<String> {
-    let token_msg = tokio::time::timeout(
-        tokio::time::Duration::from_secs(10),
-        socket.recv()
-    ).await.ok()??;
-
-    let token = match token_msg {
-        Ok(Message::Text(text)) => text.trim().to_string(),
-        _ => return None,
-    };
-
-    let claims = validate_token(&token, &state.config.jwt_secret).ok()?;
-    Some(claims.sub)
-}
-
 async fn handle_client_message(
     text: &str,
-    _user_id: &str,
+    user_id: &str,
     state: &AppState,
-    client_tx: &tokio::sync::mpsc::UnboundedSender<SignalingMessage>,
+    client_tx: &tokio::sync::mpsc::Sender<SignalingMessage>,
+    owned_sessions: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     let msg: SignalingMessage = serde_json::from_str(text)?;
 
     match msg {
         SignalingMessage::ConnectRequest { session_id, offer, .. } => {
-            // Look up the machine from the session
-            let machine = sqlx::query_as::<_, SessionMachineRow>(
-                r#"
-                SELECT m.id as machine_id
-                FROM sessions s
-                JOIN machines m ON s.machine_id = m.id
-                WHERE s.id = $1
-                "#
+            // Verify session ownership before relaying
+            let session = sqlx::query_as::<_, SessionOwnerRow>(
+                "SELECT user_id, machine_id FROM sessions WHERE id = $1"
             )
             .bind(uuid::Uuid::parse_str(&session_id)?)
             .fetch_optional(state.db.pool())
             .await?;
 
-            if let Some(machine) = machine {
+            if let Some(session) = session {
+                if session.user_id.to_string() != user_id {
+                    warn!(session_id = %session_id, "session ownership mismatch");
+                    return Ok(());
+                }
+
                 // Register client for this session
                 {
                     let mut clients = state.signaling.clients.write().await;
                     clients.insert(session_id.clone(), client_tx.clone());
+                    owned_sessions.push(session_id.clone());
                 }
 
                 // Forward to agent
                 let agents = state.signaling.agents.read().await;
-                if let Some(agent_tx) = agents.get(&machine.machine_id.to_string()) {
+                if let Some(agent_tx) = agents.get(&session.machine_id.to_string()) {
                     let _ = agent_tx.send(SignalingMessage::ConnectRequest {
                         session_id: session_id.clone(),
-                        client_id: _user_id.to_string(),
+                        client_id: user_id.to_string(),
                         offer,
-                    });
+                    }).await;
                 }
             }
         }
         SignalingMessage::SignalingOffer { session_id, offer } => {
-            // Forward offer to agent
-            let machine = sqlx::query_as::<_, SessionMachineRow>(
-                r#"
-                SELECT m.id as machine_id
-                FROM sessions s
-                JOIN machines m ON s.machine_id = m.id
-                WHERE s.id = $1
-                "#
+            // Verify session ownership
+            let session = sqlx::query_as::<_, SessionOwnerRow>(
+                "SELECT user_id, machine_id FROM sessions WHERE id = $1"
             )
             .bind(uuid::Uuid::parse_str(&session_id)?)
             .fetch_optional(state.db.pool())
             .await?;
 
-            if let Some(machine) = machine {
+            if let Some(session) = session {
+                if session.user_id.to_string() != user_id {
+                    warn!(session_id = %session_id, "session ownership mismatch");
+                    return Ok(());
+                }
+
+                // Forward offer to agent
                 let agents = state.signaling.agents.read().await;
-                if let Some(agent_tx) = agents.get(&machine.machine_id.to_string()) {
-                    let _ = agent_tx.send(SignalingMessage::SignalingOffer { session_id, offer });
+                if let Some(agent_tx) = agents.get(&session.machine_id.to_string()) {
+                    let _ = agent_tx.send(SignalingMessage::SignalingOffer { session_id, offer }).await;
                 }
             }
         }
         SignalingMessage::IceCandidate { session_id, candidate } => {
-            // Forward ICE candidate to agent
-            let machine = sqlx::query_as::<_, SessionMachineRow>(
-                r#"
-                SELECT m.id as machine_id
-                FROM sessions s
-                JOIN machines m ON s.machine_id = m.id
-                WHERE s.id = $1
-                "#
+            // Verify session ownership
+            let session = sqlx::query_as::<_, SessionOwnerRow>(
+                "SELECT user_id, machine_id FROM sessions WHERE id = $1"
             )
             .bind(uuid::Uuid::parse_str(&session_id)?)
             .fetch_optional(state.db.pool())
             .await?;
 
-            if let Some(machine) = machine {
+            if let Some(session) = session {
+                if session.user_id.to_string() != user_id {
+                    warn!(session_id = %session_id, "session ownership mismatch");
+                    return Ok(());
+                }
+
+                // Forward ICE candidate to agent
                 let agents = state.signaling.agents.read().await;
-                if let Some(agent_tx) = agents.get(&machine.machine_id.to_string()) {
-                    let _ = agent_tx.send(SignalingMessage::IceCandidate { session_id, candidate });
+                if let Some(agent_tx) = agents.get(&session.machine_id.to_string()) {
+                    let _ = agent_tx.send(SignalingMessage::IceCandidate { session_id, candidate }).await;
                 }
             }
         }
@@ -400,6 +398,7 @@ struct MachineIdRow {
 }
 
 #[derive(sqlx::FromRow)]
-struct SessionMachineRow {
+struct SessionOwnerRow {
+    user_id: uuid::Uuid,
     machine_id: uuid::Uuid,
 }

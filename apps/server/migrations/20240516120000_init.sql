@@ -1,11 +1,3 @@
--- Drop old tables (if they exist from previous migrations)
-DROP TABLE IF EXISTS oauth_accounts CASCADE;
-DROP TABLE IF EXISTS team_members CASCADE;
-DROP TABLE IF EXISTS teams CASCADE;
-DROP TABLE IF EXISTS sessions CASCADE;
-DROP TABLE IF EXISTS machines CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
-
 -- Create users table (mirror of WorkOS users)
 CREATE TABLE users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -47,7 +39,7 @@ CREATE TABLE machines (
     organization_id UUID REFERENCES organizations(id) ON DELETE SET NULL,
     name TEXT NOT NULL,
     hostname TEXT NOT NULL,
-    tailscale_ip INET,
+    tailscale_ip TEXT,
     platform TEXT NOT NULL,
     registration_token_hash TEXT NOT NULL,
     online BOOLEAN NOT NULL DEFAULT FALSE,
@@ -63,6 +55,16 @@ CREATE TABLE sessions (
     started_at TIMESTAMPTZ DEFAULT NOW(),
     ended_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'active'
+);
+
+-- Track token rotations and revocations
+CREATE TABLE machine_tokens (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    machine_id UUID NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    revoked_at TIMESTAMPTZ,
+    UNIQUE(machine_id, token_hash)
 );
 
 -- Create indexes

@@ -6,16 +6,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::auth::Claims;
-use crate::auth::routes::AppState;
 use crate::error::ApiError;
+use crate::state::AppState;
 
 /// GET /api/machines — List all machines accessible to the current user.
 pub async fn list_machines(
     Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MachinesResponse>, ApiError> {
-    let user_id = uuid::Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?;
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Fetch machines owned by user or in their organizations
     let machines = sqlx::query_as::<_, MachineRow>(
@@ -67,21 +66,36 @@ pub async fn register_machine(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterMachineRequest>,
 ) -> Result<Json<RegisterMachineResponse>, ApiError> {
-    let user_id = uuid::Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?;
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Validate organization_id if provided
+    if let Some(org_id) = req.organization_id {
+        let is_member = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM organization_members WHERE organization_id = $1 AND user_id = $2)"
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_one(state.db.pool())
+        .await?;
+
+        if !is_member {
+            return Err(ApiError::Forbidden);
+        }
+    }
 
     // Generate a registration token
     let token = format!("rkvm_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
-    let token_hash = hash_token(&token);
+    let token_hash = crate::util::hash_token(&token);
 
     let machine = sqlx::query_as::<_, MachineIdRow>(
         r#"
-        INSERT INTO machines (user_id, name, hostname, tailscale_ip, platform, registration_token_hash)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        INSERT INTO machines (user_id, organization_id, name, hostname, tailscale_ip, platform, registration_token_hash)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id
         "#
     )
     .bind(user_id)
+    .bind(req.organization_id)
     .bind(&req.name)
     .bind(&req.hostname)
     .bind(req.tailscale_ip.as_deref())
@@ -89,6 +103,63 @@ pub async fn register_machine(
     .bind(&token_hash)
     .fetch_one(state.db.pool())
     .await?;
+
+    // Store token in rotation history
+    sqlx::query(
+        "INSERT INTO machine_tokens (machine_id, token_hash) VALUES ($1, $2)"
+    )
+    .bind(machine.id)
+    .bind(&token_hash)
+    .execute(state.db.pool())
+    .await?;
+
+    Ok(Json(RegisterMachineResponse {
+        id: machine.id.to_string(),
+        registration_token: token,
+    }))
+}
+
+/// POST /api/machines/{id}/rotate-token — Rotate the registration token.
+pub async fn rotate_token(
+    Extension(claims): Extension<Claims>,
+    Path(machine_id): Path<uuid::Uuid>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<RegisterMachineResponse>, ApiError> {
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    // Verify ownership
+    let machine = sqlx::query_as::<_, MachineIdRow>(
+        "SELECT id FROM machines WHERE id = $1 AND user_id = $2"
+    )
+    .bind(machine_id)
+    .bind(user_id)
+    .fetch_optional(state.db.pool())
+    .await?
+    .ok_or_else(|| ApiError::NotFound("Machine not found".to_string()))?;
+
+    // Revoke old tokens
+    sqlx::query("UPDATE machine_tokens SET revoked_at = NOW() WHERE machine_id = $1 AND revoked_at IS NULL")
+        .bind(machine.id)
+        .execute(state.db.pool())
+        .await?;
+
+    // Generate new token
+    let token = format!("rkvm_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
+    let token_hash = crate::util::hash_token(&token);
+
+    // Update machine with new token
+    sqlx::query("UPDATE machines SET registration_token_hash = $1 WHERE id = $2")
+        .bind(&token_hash)
+        .bind(machine.id)
+        .execute(state.db.pool())
+        .await?;
+
+    // Store new token in rotation history
+    sqlx::query("INSERT INTO machine_tokens (machine_id, token_hash) VALUES ($1, $2)")
+        .bind(machine.id)
+        .bind(&token_hash)
+        .execute(state.db.pool())
+        .await?;
 
     Ok(Json(RegisterMachineResponse {
         id: machine.id.to_string(),
@@ -102,8 +173,7 @@ pub async fn get_machine(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MachineResponse>, ApiError> {
-    let user_id = uuid::Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?;
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let machine = sqlx::query_as::<_, MachineRow>(
         r#"
@@ -153,8 +223,7 @@ pub async fn delete_machine(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user_id = uuid::Uuid::parse_str(&claims.sub)
-        .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?;
+    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result = sqlx::query(
         r#"
@@ -182,6 +251,7 @@ pub struct RegisterMachineRequest {
     pub hostname: String,
     pub tailscale_ip: Option<String>,
     pub platform: String,
+    pub organization_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -246,9 +316,4 @@ struct MachineIdRow {
 
 // --- Helpers ---
 
-fn hash_token(token: &str) -> String {
-    use sha2::{Sha256, Digest};
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
+// hash_token moved to crate::util

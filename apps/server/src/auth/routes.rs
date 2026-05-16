@@ -5,11 +5,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::auth::workos::{WorkOsClient, WorkOsOrganizationMembership};
 use crate::auth::create_token;
-use crate::config::Config;
+use crate::auth::workos::WorkOsOrganizationMembership;
 use crate::db::Database;
 use crate::error::ApiError;
+use crate::state::AppState;
 
 pub async fn workos_callback(
     State(state): State<Arc<AppState>>,
@@ -70,14 +70,6 @@ pub async fn workos_callback(
                 .collect(),
         },
     }))
-}
-
-#[derive(Clone)]
-pub struct AppState {
-    pub db: Database,
-    pub workos: WorkOsClient,
-    pub config: Config,
-    pub signaling: crate::websocket::SignalingState,
 }
 
 #[derive(Debug, Deserialize)]

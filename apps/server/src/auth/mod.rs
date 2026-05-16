@@ -57,3 +57,11 @@ pub fn validate_token(token: &str, secret: &str) -> Result<Claims> {
 
     Ok(token_data.claims)
 }
+
+impl Claims {
+    /// Parse the `sub` claim as a UUID.
+    pub fn user_id(&self) -> anyhow::Result<uuid::Uuid> {
+        uuid::Uuid::parse_str(&self.sub)
+            .map_err(|e| anyhow::anyhow!("Invalid user ID in JWT claims: {}", e))
+    }
+}

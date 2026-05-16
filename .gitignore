@@ -9,3 +9,7 @@ Cargo.lock.bak
 # Server
 apps/server/.env
 !apps/server/.env.example
+
+# Claude Code worktrees
+.claude/
+

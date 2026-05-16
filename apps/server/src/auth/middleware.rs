@@ -1,14 +1,13 @@
 use axum::{
     extract::{Request, State},
-    http::StatusCode,
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use std::sync::Arc;
 
-use crate::auth::routes::AppState;
 use crate::auth::validate_token;
 use crate::error::ApiError;
+use crate::state::AppState;
 
 /// JWT authentication middleware.
 /// Extracts the Bearer token from the Authorization header, validates it,
@@ -37,14 +36,4 @@ pub async fn jwt_auth_middleware(
     Ok(next.run(request).await)
 }
 
-/// Optional: A simpler version that returns 401 directly without our ApiError format
-pub async fn auth_layer(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    match jwt_auth_middleware(State(state), request, next).await {
-        Ok(response) => response,
-        Err(_) => (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    }
-}
+// auth_layer removed — jwt_auth_middleware is the canonical entry point

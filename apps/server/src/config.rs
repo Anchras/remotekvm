@@ -20,13 +20,22 @@ impl Config {
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost/remotekvm".to_string());
 
         let workos_api_key = std::env::var("WORKOS_API_KEY")
-            .unwrap_or_else(|_| "".to_string());
+            .map_err(|_| anyhow::anyhow!("WORKOS_API_KEY must be set"))?;
+        if workos_api_key.is_empty() {
+            anyhow::bail!("WORKOS_API_KEY must not be empty");
+        }
 
         let workos_client_id = std::env::var("WORKOS_CLIENT_ID")
-            .unwrap_or_else(|_| "".to_string());
+            .map_err(|_| anyhow::anyhow!("WORKOS_CLIENT_ID must be set"))?;
+        if workos_client_id.is_empty() {
+            anyhow::bail!("WORKOS_CLIENT_ID must not be empty");
+        }
 
         let jwt_secret = std::env::var("JWT_SECRET")
-            .unwrap_or_else(|_| "change-me-in-production".to_string());
+            .map_err(|_| anyhow::anyhow!("JWT_SECRET must be set"))?;
+        if jwt_secret.len() < 32 {
+            anyhow::bail!("JWT_SECRET must be at least 32 bytes");
+        }
 
         let jwt_expiry_hours = std::env::var("JWT_EXPIRY_HOURS")
             .unwrap_or_else(|_| "24".to_string())
