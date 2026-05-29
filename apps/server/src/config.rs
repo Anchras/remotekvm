@@ -1,13 +1,31 @@
 use anyhow::Result;
 
+/// Default WorkOS API base URL. Overridable via `WORKOS_API_BASE` (used by
+/// integration tests to point at a local mock).
+pub const DEFAULT_WORKOS_API_BASE: &str = "https://api.workos.com";
+
+/// Default Stripe API base URL. Overridable via `STRIPE_API_BASE` (used by
+/// integration tests to point at a local mock).
+pub const DEFAULT_STRIPE_API_BASE: &str = "https://api.stripe.com";
+
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
     pub database_url: String,
     pub workos_api_key: String,
     pub workos_client_id: String,
+    pub workos_api_base: String,
+    /// Public base URL of this server, used to build the WorkOS redirect URI
+    /// (`{public_base_url}/auth/workos/callback`). Defaults to
+    /// `http://localhost:{port}`.
+    pub public_base_url: String,
     pub jwt_secret: String,
     pub jwt_expiry_hours: i64,
+    // --- Stripe billing (optional; endpoints 400 if the key is unset) ---
+    pub stripe_secret_key: String,
+    pub stripe_webhook_secret: String,
+    pub stripe_price_id: String,
+    pub stripe_api_base: String,
 }
 
 impl Config {
@@ -31,8 +49,8 @@ impl Config {
             anyhow::bail!("WORKOS_CLIENT_ID must not be empty");
         }
 
-        let jwt_secret = std::env::var("JWT_SECRET")
-            .map_err(|_| anyhow::anyhow!("JWT_SECRET must be set"))?;
+        let jwt_secret =
+            std::env::var("JWT_SECRET").map_err(|_| anyhow::anyhow!("JWT_SECRET must be set"))?;
         if jwt_secret.len() < 32 {
             anyhow::bail!("JWT_SECRET must be at least 32 bytes");
         }
@@ -41,13 +59,32 @@ impl Config {
             .unwrap_or_else(|_| "24".to_string())
             .parse()?;
 
+        let workos_api_base = std::env::var("WORKOS_API_BASE")
+            .unwrap_or_else(|_| DEFAULT_WORKOS_API_BASE.to_string());
+
+        let public_base_url =
+            std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://localhost:{port}"));
+
+        // Stripe is optional: billing endpoints return an error if unconfigured.
+        let stripe_secret_key = std::env::var("STRIPE_SECRET_KEY").unwrap_or_default();
+        let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
+        let stripe_price_id = std::env::var("STRIPE_PRICE_ID").unwrap_or_default();
+        let stripe_api_base = std::env::var("STRIPE_API_BASE")
+            .unwrap_or_else(|_| DEFAULT_STRIPE_API_BASE.to_string());
+
         Ok(Config {
             port,
             database_url,
             workos_api_key,
             workos_client_id,
+            workos_api_base,
+            public_base_url,
             jwt_secret,
             jwt_expiry_hours,
+            stripe_secret_key,
+            stripe_webhook_secret,
+            stripe_price_id,
+            stripe_api_base,
         })
     }
 }

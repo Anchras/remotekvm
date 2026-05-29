@@ -19,9 +19,12 @@ pub async fn me_handler(
         SELECT id, workos_user_id, email, first_name, last_name, avatar_url
         FROM users
         WHERE id = $1
-        "#
+        "#,
     )
-    .bind(uuid::Uuid::parse_str(&claims.sub).map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?)
+    .bind(
+        uuid::Uuid::parse_str(&claims.sub)
+            .map_err(|_| ApiError::Internal("Invalid user ID".to_string()))?,
+    )
     .fetch_one(state.db.pool())
     .await?;
 
@@ -31,7 +34,7 @@ pub async fn me_handler(
         FROM organizations o
         JOIN organization_members om ON o.id = om.organization_id
         WHERE om.user_id = $1
-        "#
+        "#,
     )
     .bind(user.id)
     .fetch_all(state.db.pool())
@@ -44,13 +47,16 @@ pub async fn me_handler(
         first_name: user.first_name,
         last_name: user.last_name,
         avatar_url: user.avatar_url,
-        organizations: organizations.into_iter().map(|o| OrganizationResponse {
-            id: o.id.to_string(),
-            workos_org_id: o.workos_org_id,
-            name: o.name,
-            slug: o.slug,
-            role: o.role,
-        }).collect(),
+        organizations: organizations
+            .into_iter()
+            .map(|o| OrganizationResponse {
+                id: o.id.to_string(),
+                workos_org_id: o.workos_org_id,
+                name: o.name,
+                slug: o.slug,
+                role: o.role,
+            })
+            .collect(),
     }))
 }
 

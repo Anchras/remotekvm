@@ -24,7 +24,13 @@ impl VideoEncoder {
         bitrate_kbps: u32,
         _sender: mpsc::Sender<EncodedFrame>,
     ) -> Result<Self> {
-        tracing::info!(width, height, fps, bitrate_kbps, "initializing video encoder");
+        tracing::info!(
+            width,
+            height,
+            fps,
+            bitrate_kbps,
+            "initializing video encoder"
+        );
         // TODO: Detect GPU, prefer NVENC, fallback to Media Foundation
         anyhow::bail!("Video encoder not yet implemented")
     }

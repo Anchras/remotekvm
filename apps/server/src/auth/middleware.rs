@@ -27,8 +27,8 @@ pub async fn jwt_auth_middleware(
         _ => return Err(ApiError::Unauthorized),
     };
 
-    let claims = validate_token(token, &state.config.jwt_secret)
-        .map_err(|_| ApiError::Unauthorized)?;
+    let claims =
+        validate_token(token, &state.config.jwt_secret).map_err(|_| ApiError::Unauthorized)?;
 
     // Add claims to request extensions for downstream handlers
     request.extensions_mut().insert(claims);

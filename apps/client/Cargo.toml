@@ -30,10 +30,17 @@ egui-winit = "0.28"
 # Networking
 reqwest = { workspace = true }
 tokio-tungstenite = "0.24"
+futures-util = "0.3"
 url = "2"
 
 # Async runtime integration
 pollster = "0.3"
+
+# Secure token storage (macOS Keychain / Windows Credential Manager / libsecret)
+keyring = "2"
+
+# Open the system browser for the OAuth/AuthKit login flow
+open = "5"
 
 # Image decoding (for app icons if needed)
 image = { version = "0.25", default-features = false, features = ["png"] }
@@ -41,3 +48,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL"] }
+
+[dev-dependencies]
+axum = { workspace = true }

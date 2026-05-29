@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "remotekvm_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "remotekvm-server"
 path = "src/main.rs"
@@ -27,6 +31,16 @@ reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 ipnetwork = { workspace = true }
 sha2 = { workspace = true }
+hmac = "0.12"
+hex = "0.4"
 
 [dev-dependencies]
 reqwest = { workspace = true }
+sqlx = { workspace = true }
+remotekvm-transport = { workspace = true }
+remotekvm-protocol = { workspace = true }
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+hmac = "0.12"
+hex = "0.4"
+sha2 = { workspace = true }

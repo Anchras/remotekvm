@@ -9,7 +9,7 @@ pub mod workos;
 /// JWT claims for our own session tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,       // user UUID
+    pub sub: String, // user UUID
     pub workos_user_id: String,
     pub email: String,
     pub iat: usize,
@@ -24,9 +24,7 @@ pub fn create_token(
     secret: &str,
     expiry_hours: i64,
 ) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_secs() as usize;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as usize;
     let exp = now + (expiry_hours as usize) * 3600;
 
     let claims = Claims {

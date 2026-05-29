@@ -33,7 +33,12 @@ pub struct OpusEncoder {
 
 impl OpusEncoder {
     pub fn new(sample_rate: u32, channels: u16, bitrate_kbps: u32) -> Result<Self> {
-        tracing::info!(sample_rate, channels, bitrate_kbps, "initializing Opus encoder");
+        tracing::info!(
+            sample_rate,
+            channels,
+            bitrate_kbps,
+            "initializing Opus encoder"
+        );
         // TODO: Create opus encoder
         anyhow::bail!("Opus encoder not yet implemented")
     }
