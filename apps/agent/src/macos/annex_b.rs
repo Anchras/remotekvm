@@ -21,8 +21,8 @@ pub fn sample_to_annex_b(sample: &CMSampleBuffer, is_keyframe: bool) -> Result<V
         append_hevc_parameter_sets(&fmt, &mut out)?;
     }
 
-    let block = unsafe { sample.data_buffer() }
-        .ok_or_else(|| anyhow!("sample has no data buffer"))?;
+    let block =
+        unsafe { sample.data_buffer() }.ok_or_else(|| anyhow!("sample has no data buffer"))?;
     append_avcc_as_annex_b(&block, &mut out)?;
 
     Ok(out)
@@ -71,17 +71,25 @@ fn append_avcc_as_annex_b(block: &CMBlockBuffer, out: &mut Vec<u8>) -> Result<()
     let total = unsafe { block.data_length() };
     let mut buf = vec![0u8; total];
     let status = unsafe {
-        block.copy_data_bytes(0, total, NonNull::new(buf.as_mut_ptr() as *mut c_void).unwrap())
+        block.copy_data_bytes(
+            0,
+            total,
+            NonNull::new(buf.as_mut_ptr() as *mut c_void).unwrap(),
+        )
     };
     if status != 0 {
         return Err(anyhow!("CMBlockBufferCopyDataBytes status={status}"));
     }
     let mut pos = 0;
     while pos + 4 <= buf.len() {
-        let nal_len = u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
+        let nal_len =
+            u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]]) as usize;
         pos += 4;
         if pos + nal_len > buf.len() {
-            return Err(anyhow!("truncated NAL: declared {nal_len} bytes, only {} remaining", buf.len() - pos));
+            return Err(anyhow!(
+                "truncated NAL: declared {nal_len} bytes, only {} remaining",
+                buf.len() - pos
+            ));
         }
         out.extend_from_slice(&ANNEX_B_START_CODE);
         out.extend_from_slice(&buf[pos..pos + nal_len]);

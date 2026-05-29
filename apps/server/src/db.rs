@@ -1,6 +1,6 @@
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, migrate::MigrateDatabase};
+use sqlx::{migrate::MigrateDatabase, PgPool};
 use tracing::info;
 
 #[derive(Clone)]
@@ -24,10 +24,16 @@ impl Database {
         Ok(Database { pool })
     }
 
+    /// Build a `Database` from an already-established pool.
+    ///
+    /// Used by integration tests, which obtain an isolated pool from
+    /// `#[sqlx::test]` rather than connecting by URL.
+    pub fn from_pool(pool: PgPool) -> Self {
+        Database { pool }
+    }
+
     pub async fn run_migrations(&self) -> Result<()> {
-        sqlx::migrate!("./migrations")
-            .run(&self.pool)
-            .await?;
+        sqlx::migrate!("./migrations").run(&self.pool).await?;
         Ok(())
     }
 

@@ -8,6 +8,11 @@ license.workspace = true
 name = "remotekvm-agent"
 path = "src/main.rs"
 
+[features]
+# Opt-in legacy macOS capture/encode pipeline (ScreenCaptureKit + VideoToolbox).
+# Not yet adapted to the SaaS session; enable with `--features macos_v0`.
+macos_v0 = []
+
 [dependencies]
 remotekvm-protocol = { workspace = true }
 remotekvm-transport = { workspace = true }
@@ -76,3 +81,4 @@ objc2-video-toolbox = { version = "0.3", features = [
 ] }
 block2 = "0.6"
 dispatch2 = "0.3"
+core-graphics = { version = "0.24", features = ["highsierra"] }

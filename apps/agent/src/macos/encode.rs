@@ -96,7 +96,9 @@ impl Encoder {
 
         let status = unsafe { session.prepare_to_encode_frames() };
         if status != 0 {
-            return Err(anyhow!("VTCompressionSessionPrepareToEncodeFrames failed: {status}"));
+            return Err(anyhow!(
+                "VTCompressionSessionPrepareToEncodeFrames failed: {status}"
+            ));
         }
 
         Ok(Self {
@@ -140,7 +142,11 @@ impl Drop for Encoder {
 
 fn configure_session(session: &VTCompressionSession, cfg: &EncoderConfig) -> Result<()> {
     set_bool(session, unsafe { kVTCompressionPropertyKey_RealTime }, true)?;
-    set_bool(session, unsafe { kVTCompressionPropertyKey_AllowFrameReordering }, false)?;
+    set_bool(
+        session,
+        unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
+        false,
+    )?;
     set_bool(
         session,
         unsafe { kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality },
@@ -165,7 +171,11 @@ fn configure_session(session: &VTCompressionSession, cfg: &EncoderConfig) -> Res
 }
 
 fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Result<()> {
-    let v = if value { CFBoolean::true_() } else { CFBoolean::false_() };
+    let v = if value {
+        CFBoolean::true_()
+    } else {
+        CFBoolean::false_()
+    };
     let status = unsafe { session.set_property(key, Some(v.as_ref().as_opaque())) };
     if status != 0 {
         return Err(anyhow!("VTSessionSetProperty(bool) failed: {status}"));

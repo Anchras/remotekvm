@@ -31,10 +31,9 @@ async fn run_foreground() -> Result<()> {
     let config = crate::config::Config::from_env()?;
 
     // Connect to the SaaS server
-    let server = crate::server_client::ServerClient::connect(
-        &config.server_url,
-        &config.registration_token,
-    ).await?;
+    let server =
+        crate::server_client::ServerClient::connect(&config.server_url, &config.registration_token)
+            .await?;
 
     info!("service controller connected to server");
 

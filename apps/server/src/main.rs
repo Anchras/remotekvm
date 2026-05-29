@@ -1,27 +1,14 @@
 use anyhow::Result;
-use axum::{
-    middleware,
-    routing::{delete, get, post},
-    Router,
-};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::info;
 
-mod auth;
-mod config;
-mod db;
-mod error;
-mod routes;
-mod state;
-mod util;
-mod websocket;
-
-use auth::middleware::jwt_auth_middleware;
-use auth::workos::WorkOsClient;
-use config::Config;
-use db::Database;
-use state::AppState;
+use remotekvm_server::auth::workos::WorkOsClient;
+use remotekvm_server::config::Config;
+use remotekvm_server::create_app;
+use remotekvm_server::db::Database;
+use remotekvm_server::state::AppState;
+use remotekvm_server::websocket::SignalingState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,10 +33,11 @@ async fn main() -> Result<()> {
     let workos = WorkOsClient::new(
         config.workos_api_key.clone(),
         config.workos_client_id.clone(),
+        config.workos_api_base.clone(),
     );
     info!("workos client initialized");
 
-    let signaling = websocket::SignalingState::new();
+    let signaling = SignalingState::new();
 
     let state = Arc::new(AppState {
         db,
@@ -84,38 +72,4 @@ async fn main() -> Result<()> {
 
     info!("server shut down gracefully");
     Ok(())
-}
-
-fn create_app(state: Arc<AppState>) -> Router {
-    use tower_http::trace::TraceLayer;
-
-    // Public routes (no auth required)
-    let public_routes = Router::new()
-        .route("/health", get(routes::health_handler))
-        .route("/auth/workos/callback", get(auth::routes::workos_callback));
-
-    // Protected API routes (JWT auth required)
-    let api_routes = Router::new()
-        .route("/api/me", get(routes::me::me_handler))
-        .route("/api/machines", get(routes::machines::list_machines))
-        .route("/api/machines", post(routes::machines::register_machine))
-        .route("/api/machines/:id", get(routes::machines::get_machine))
-        .route("/api/machines/:id", delete(routes::machines::delete_machine))
-        .route("/api/machines/:id/rotate-token", post(routes::machines::rotate_token))
-        .route("/api/machines/:id/connect", post(routes::sessions::connect_machine))
-        .route_layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            jwt_auth_middleware,
-        ));
-
-    // WebSocket routes
-    let ws_routes = Router::new()
-        .route("/agent", get(websocket::agent_ws_handler))
-        .route("/client", get(websocket::client_ws_handler));
-
-    public_routes
-        .merge(api_routes)
-        .merge(ws_routes)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
 }

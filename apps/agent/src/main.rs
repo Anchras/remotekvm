@@ -1,17 +1,20 @@
 // remotekvm-agent
 //
-// Phase 1 (MVP): Windows service + session agent architecture.
-//
-// Architecture:
-//   - Service Controller (Windows Session 0): persistent server connection, spawns session agents
-//   - Session Agent (user session): capture, encode, WebRTC, input injection
+// Connects to the SaaS coordination server, accepts client connection requests,
+// and establishes a WebRTC session per connection. The control DataChannel
+// carries input events (client → host), which are injected into the OS.
 //
 // Platform support:
-//   - Windows: primary target (DXGI, NVENC, WASAPI, SendInput)
-//   - macOS: development fallback (ScreenCaptureKit, VideoToolbox)
+//   - macOS: signaling + control channel + input injection work today; the
+//     ScreenCaptureKit/VideoToolbox capture→video-track wiring is the next step.
+//   - Windows: capture/encode/audio/service are Phase 1 (still stubbed).
 
 use anyhow::Result;
 use clap::Parser;
+use std::sync::Arc;
+
+use remotekvm_protocol::ChannelMessage;
+use remotekvm_transport::PeerSession;
 
 #[cfg(target_os = "windows")]
 mod windows;
@@ -19,11 +22,11 @@ mod windows;
 #[cfg(all(target_os = "macos", feature = "macos_v0"))]
 mod macos;
 
-mod config;
+mod input;
 mod server_client;
 mod signaling;
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(version)]
 struct Args {
     /// Server WebSocket URL.
@@ -63,64 +66,36 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if args.service {
-            windows::service::run_service().await
-        } else {
-            run_standalone(args).await
+            return windows::service::run_service().await;
         }
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        run_macos(args).await
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        anyhow::bail!("remotekvm-agent currently only supports Windows and macOS")
-    }
+    run_standalone(args).await
 }
 
-/// Standalone agent mode (for development/testing).
-/// Connects to the server and runs the full pipeline in-process.
-#[cfg(target_os = "windows")]
+/// Connect to the server and run a session per inbound connection request.
 async fn run_standalone(args: Args) -> Result<()> {
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
     tracing::info!(
         server_url = %args.server_url,
         width = args.width,
         height = args.height,
         fps = args.fps,
         bitrate_kbps = args.bitrate_kbps,
-        "agent starting in standalone mode"
+        "agent starting"
     );
 
-    // Connect to the SaaS server
-    let token = args.token.ok_or_else(|| {
-        anyhow::anyhow!("Registration token required. Provide via --token or RKVM_REGISTRATION_TOKEN")
+    let token = args.token.clone().ok_or_else(|| {
+        anyhow::anyhow!("Registration token required (--token or RKVM_REGISTRATION_TOKEN)")
     })?;
 
-    let server_client = server_client::ServerClient::connect(&args.server_url, &token).await?;
+    let (server, mut requests) =
+        server_client::ServerClient::connect(&args.server_url, &token).await?;
+    let server = Arc::new(server);
     tracing::info!("connected to SaaS server");
 
-    // Wait for connection requests from the server
-    // When a client wants to connect, the server sends us a ConnectRequest via WebSocket
-    let (connection_tx, mut connection_rx) = mpsc::unbounded_channel::<signaling::ConnectionRequest>();
-    let server_client = Arc::new(server_client);
-
-    // Spawn a task to handle incoming connection requests
-    let server_clone = Arc::clone(&server_client);
-    tokio::spawn(async move {
-        if let Err(e) = server_clone.handle_messages(connection_tx).await {
-            tracing::error!(error = %e, "server message handler failed");
-        }
-    });
-
-    // Main loop: wait for connection requests and spawn sessions
     loop {
         let request = tokio::select! {
-            req = connection_rx.recv() => req,
+            req = requests.recv() => req,
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Ctrl+C received, shutting down");
                 break;
@@ -133,12 +108,11 @@ async fn run_standalone(args: Args) -> Result<()> {
         };
 
         tracing::info!(session_id = %request.session_id, "connection request received");
-
-        // Spawn a session agent to handle this connection
-        let server_for_session = Arc::clone(&server_client);
+        let server = Arc::clone(&server);
         tokio::spawn(async move {
-            if let Err(e) = run_session(server_for_session, request, &args).await {
-                tracing::error!(error = %e, session_id = %request.session_id, "session failed");
+            let session_id = request.session_id.clone();
+            if let Err(e) = run_session(server, request).await {
+                tracing::error!(error = %e, %session_id, "session failed");
             }
         });
     }
@@ -146,78 +120,37 @@ async fn run_standalone(args: Args) -> Result<()> {
     Ok(())
 }
 
-/// Run a single remote session (capture + encode + WebRTC + input).
-#[cfg(target_os = "windows")]
+/// Establish a WebRTC session for one connection request and inject the input
+/// events that arrive over the control channel.
 async fn run_session(
     server: Arc<server_client::ServerClient>,
     request: signaling::ConnectionRequest,
-    args: &Args,
 ) -> Result<()> {
-    use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
-    use webrtc::api::APIBuilder;
-    use webrtc::peer_connection::configuration::RTCConfiguration;
-    use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-    use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
-    use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
-
     tracing::info!(session_id = %request.session_id, "starting session");
 
-    // Create WebRTC peer connection
-    let mut media_engine = MediaEngine::default();
-    media_engine.register_default_codecs()?;
+    let session = PeerSession::answerer().await?;
+    session.accept_offer(&request.offer).await?;
 
-    let api = APIBuilder::new()
-        .with_media_engine(media_engine)
-        .build();
+    // Non-trickle: the answer embeds our ICE candidates, matching the offer the
+    // client sends. (The server relay also supports trickle ICE messages.)
+    let answer = session.wait_ice_gathering().await?;
+    server.send_answer(&request.session_id, &answer)?;
 
-    let config = RTCConfiguration {
-        ice_servers: vec![],
-        ..Default::default()
-    };
+    // TODO (Phase 1/3): create a video track from the platform capture+encode
+    // pipeline (DXGI/NVENC on Windows, ScreenCaptureKit/VideoToolbox on macOS)
+    // and add it to `session.peer_connection()` before answering.
 
-    let peer_connection = Arc::new(api.new_peer_connection(config).await?);
+    let injector = input::InputInjector::new();
+    while let Some(msg) = session.recv().await {
+        match msg {
+            ChannelMessage::Input(event) => injector.inject(&event),
+            ChannelMessage::Control(ctrl) => {
+                tracing::debug!(?ctrl, "control message received")
+            }
+        }
+    }
 
-    // Create video track
-    let video_track = Arc::new(TrackLocalStaticSample::new(
-        RTCRtpCodecCapability {
-            mime_type: MIME_TYPE_H264.to_owned(),
-            ..Default::default()
-        },
-        "video".to_owned(),
-        "screen".to_owned(),
-    ));
-
-    let _ = peer_connection
-        .add_track(video_track.clone())
-        .await;
-
-    // Set remote description (the offer from the client)
-    let offer = RTCSessionDescription::offer(request.offer)?;
-    peer_connection.set_remote_description(offer).await?;
-
-    // Create answer
-    let answer = peer_connection.create_answer(None).await?;
-    peer_connection.set_local_description(answer.clone()).await?;
-
-    // Send answer back to client via server
-    server.send_answer(&request.session_id, &answer.sdp).await?;
-
-    // TODO: Set up capture pipeline and start streaming
-    // TODO: Set up audio track (Opus)
-    // TODO: Set up DataChannel for input events
-
-    // Wait for session to end
-    tokio::signal::ctrl_c().await?;
-
-    peer_connection.close().await?;
+    session.close().await?;
     tracing::info!(session_id = %request.session_id, "session ended");
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-async fn run_macos(_args: Args) -> Result<()> {
-    tracing::info!("macOS agent mode: using legacy capture pipeline for development");
-    // For now, macOS agent just runs the v0 capture pipeline
-    // TODO: Adapt macOS code to new agent architecture (Phase 3)
-    anyhow::bail!("macOS agent not yet adapted to SaaS architecture")
 }

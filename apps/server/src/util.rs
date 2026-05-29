@@ -1,4 +1,4 @@
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// Hash a token using SHA-256 for storage.
 pub fn hash_token(token: &str) -> String {

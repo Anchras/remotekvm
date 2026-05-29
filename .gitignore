@@ -9,6 +9,7 @@ Cargo.lock.bak
 # Server
 apps/server/.env
 !apps/server/.env.example
+apps/server/docker-compose.override.yml
 
 # Claude Code worktrees
 .claude/

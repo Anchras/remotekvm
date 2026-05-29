@@ -16,10 +16,7 @@ impl DxgiCapturer {
         anyhow::bail!("DXGI capture not yet implemented")
     }
 
-    pub async fn start(
-        &self,
-        _sender: mpsc::Sender<CapturedFrame>,
-    ) -> Result<()> {
+    pub async fn start(&self, _sender: mpsc::Sender<CapturedFrame>) -> Result<()> {
         // TODO: Run capture loop in a thread, send frames via channel
         anyhow::bail!("DXGI capture not yet implemented")
     }

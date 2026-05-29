@@ -14,7 +14,9 @@ pub async fn list_machines(
     Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MachinesResponse>, ApiError> {
-    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Fetch machines owned by user or in their organizations
     let machines = sqlx::query_as::<_, MachineRow>(
@@ -32,31 +34,34 @@ pub async fn list_machines(
                SELECT organization_id FROM organization_members WHERE user_id = $1
            )
         ORDER BY m.online DESC, m.name ASC
-        "#
+        "#,
     )
     .bind(user_id)
     .fetch_all(state.db.pool())
     .await?;
 
     Ok(Json(MachinesResponse {
-        machines: machines.into_iter().map(|m| MachineResponse {
-            id: m.id.to_string(),
-            name: m.name,
-            hostname: m.hostname,
-            tailscale_ip: m.tailscale_ip.map(|ip| ip.to_string()),
-            platform: m.platform,
-            online: m.online,
-            last_seen: m.last_seen.map(|t| t.to_rfc3339()),
-            created_at: m.created_at.to_rfc3339(),
-            owner: m.owner_id.map(|id| UserRef {
-                id: id.to_string(),
-                email: m.owner_email.unwrap_or_default(),
-            }),
-            organization: m.org_id.map(|id| OrgRef {
-                id: id.to_string(),
-                name: m.org_name.unwrap_or_default(),
-            }),
-        }).collect(),
+        machines: machines
+            .into_iter()
+            .map(|m| MachineResponse {
+                id: m.id.to_string(),
+                name: m.name,
+                hostname: m.hostname,
+                tailscale_ip: m.tailscale_ip.map(|ip| ip.to_string()),
+                platform: m.platform,
+                online: m.online,
+                last_seen: m.last_seen.map(|t| t.to_rfc3339()),
+                created_at: m.created_at.to_rfc3339(),
+                owner: m.owner_id.map(|id| UserRef {
+                    id: id.to_string(),
+                    email: m.owner_email.unwrap_or_default(),
+                }),
+                organization: m.org_id.map(|id| OrgRef {
+                    id: id.to_string(),
+                    name: m.org_name.unwrap_or_default(),
+                }),
+            })
+            .collect(),
     }))
 }
 
@@ -66,7 +71,9 @@ pub async fn register_machine(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RegisterMachineRequest>,
 ) -> Result<Json<RegisterMachineResponse>, ApiError> {
-    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Validate organization_id if provided
     if let Some(org_id) = req.organization_id {
@@ -105,13 +112,11 @@ pub async fn register_machine(
     .await?;
 
     // Store token in rotation history
-    sqlx::query(
-        "INSERT INTO machine_tokens (machine_id, token_hash) VALUES ($1, $2)"
-    )
-    .bind(machine.id)
-    .bind(&token_hash)
-    .execute(state.db.pool())
-    .await?;
+    sqlx::query("INSERT INTO machine_tokens (machine_id, token_hash) VALUES ($1, $2)")
+        .bind(machine.id)
+        .bind(&token_hash)
+        .execute(state.db.pool())
+        .await?;
 
     Ok(Json(RegisterMachineResponse {
         id: machine.id.to_string(),
@@ -125,23 +130,26 @@ pub async fn rotate_token(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<RegisterMachineResponse>, ApiError> {
-    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     // Verify ownership
-    let machine = sqlx::query_as::<_, MachineIdRow>(
-        "SELECT id FROM machines WHERE id = $1 AND user_id = $2"
-    )
-    .bind(machine_id)
-    .bind(user_id)
-    .fetch_optional(state.db.pool())
-    .await?
-    .ok_or_else(|| ApiError::NotFound("Machine not found".to_string()))?;
+    let machine =
+        sqlx::query_as::<_, MachineIdRow>("SELECT id FROM machines WHERE id = $1 AND user_id = $2")
+            .bind(machine_id)
+            .bind(user_id)
+            .fetch_optional(state.db.pool())
+            .await?
+            .ok_or_else(|| ApiError::NotFound("Machine not found".to_string()))?;
 
     // Revoke old tokens
-    sqlx::query("UPDATE machine_tokens SET revoked_at = NOW() WHERE machine_id = $1 AND revoked_at IS NULL")
-        .bind(machine.id)
-        .execute(state.db.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE machine_tokens SET revoked_at = NOW() WHERE machine_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(machine.id)
+    .execute(state.db.pool())
+    .await?;
 
     // Generate new token
     let token = format!("rkvm_{}", uuid::Uuid::new_v4().to_string().replace("-", ""));
@@ -173,7 +181,9 @@ pub async fn get_machine(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MachineResponse>, ApiError> {
-    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let machine = sqlx::query_as::<_, MachineRow>(
         r#"
@@ -189,7 +199,7 @@ pub async fn get_machine(
           AND (m.user_id = $2 OR m.organization_id IN (
               SELECT organization_id FROM organization_members WHERE user_id = $2
           ))
-        "#
+        "#,
     )
     .bind(machine_id)
     .bind(user_id)
@@ -223,13 +233,15 @@ pub async fn delete_machine(
     Path(machine_id): Path<uuid::Uuid>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let user_id = claims.user_id().map_err(|e| ApiError::Internal(e.to_string()))?;
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
 
     let result = sqlx::query(
         r#"
         DELETE FROM machines
         WHERE id = $1 AND user_id = $2
-        "#
+        "#,
     )
     .bind(machine_id)
     .bind(user_id)
@@ -237,7 +249,9 @@ pub async fn delete_machine(
     .await?;
 
     if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound("Machine not found or not owned by you".to_string()));
+        return Err(ApiError::NotFound(
+            "Machine not found or not owned by you".to_string(),
+        ));
     }
 
     Ok(Json(serde_json::json!({"status": "deleted"})))

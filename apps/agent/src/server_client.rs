@@ -1,119 +1,132 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc::UnboundedSender;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 use crate::signaling::ConnectionRequest;
 
-/// WebSocket client for connecting to the SaaS coordination server.
+/// WebSocket client for the SaaS coordination server.
+///
+/// Holds a **single persistent** connection: a reader task surfaces inbound
+/// `ConnectRequest`s and answers heartbeats, while outbound signaling
+/// (answers, ICE candidates) is sent over the same socket via an mpsc queue.
+///
+/// (A previous version opened a fresh WebSocket per message, which — with the
+/// relay's per-connection registration — would repeatedly flap the machine
+/// offline and evict the persistent registration.)
 pub struct ServerClient {
-    url: String,
-    token: String,
+    outbound: UnboundedSender<Message>,
+    /// Reader + writer tasks, aborted when the client is dropped so a discarded
+    /// connection (e.g. during a reconnect) doesn't leak tasks or the socket.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ServerClient {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
 }
 
 impl ServerClient {
-    /// Connect to the server WebSocket endpoint.
-    pub async fn connect(url: &str, token: &str) -> Result<Self> {
-        // The server expects the token as a query parameter: /agent?token=<token>
+    /// Connect, send `hello`, and start the reader/writer tasks. Returns the
+    /// client plus a receiver of inbound connection requests.
+    pub async fn connect(
+        url: &str,
+        token: &str,
+    ) -> Result<(Self, UnboundedReceiver<ConnectionRequest>)> {
         let url_with_token = format!("{}?token={}", url, urlencoding::encode(token));
-
-        // Test the connection
         let (ws_stream, _) = connect_async(&url_with_token)
             .await
             .context("Failed to connect to SaaS server WebSocket")?;
 
-        // We don't keep the stream open here; reconnect on each use for simplicity
-        // In production, use a persistent connection with automatic reconnection
-        drop(ws_stream);
+        let (mut write, mut read) = ws_stream.split();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
+        let (req_tx, req_rx) = mpsc::unbounded_channel::<ConnectionRequest>();
 
-        Ok(ServerClient {
-            url: url.to_string(),
-            token: token.to_string(),
-        })
-    }
+        // Announce ourselves.
+        let hello = serde_json::json!({ "type": "hello", "version": env!("CARGO_PKG_VERSION") });
+        out_tx
+            .send(Message::Text(hello.to_string()))
+            .ok()
+            .context("failed to enqueue hello")?;
 
-    /// Listen for messages from the server and forward connection requests.
-    pub async fn handle_messages(&self, tx: UnboundedSender<ConnectionRequest>) -> Result<()> {
-        let url_with_token = format!("{}?token={}", self.url, urlencoding::encode(&self.token));
-        let (mut ws_stream, _) = connect_async(&url_with_token).await?;
-
-        // Send hello
-        let hello = serde_json::json!({
-            "type": "hello",
-            "version": env!("CARGO_PKG_VERSION")
-        });
-        ws_stream.send(Message::Text(hello.to_string())).await?;
-
-        loop {
-            tokio::select! {
-                msg = ws_stream.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Ok(signal) = serde_json::from_str::<ServerSignal>(&text) {
-                                match signal {
-                                    ServerSignal::ConnectRequest { session_id, offer } => {
-                                        let _ = tx.send(ConnectionRequest {
-                                            session_id,
-                                            offer,
-                                        });
-                                    }
-                                    ServerSignal::Heartbeat => {
-                                        let heartbeat = serde_json::json!({"type": "heartbeat"});
-                                        if let Err(e) = ws_stream.send(Message::Text(heartbeat.to_string())).await {
-                                            tracing::warn!(error = %e, "failed to send heartbeat");
-                                        }
-                                    }
-                                    _ => {
-                                        tracing::debug!("received signal: {:?}", signal);
-                                    }
-                                }
-                            }
-                        }
-                        Some(Ok(Message::Close(_))) | None => {
-                            tracing::warn!("server closed WebSocket connection");
-                            break;
-                        }
-                        Some(Err(e)) => {
-                            return Err(e.into());
-                        }
-                        _ => {}
-                    }
+        // Writer task: drain the outbound queue onto the socket.
+        let writer = tokio::spawn(async move {
+            while let Some(msg) = out_rx.recv().await {
+                if let Err(e) = write.send(msg).await {
+                    tracing::warn!(error = %e, "failed to send on agent websocket");
+                    break;
                 }
             }
-        }
+        });
 
-        Ok(())
+        // Reader task: dispatch inbound messages.
+        let reader_out = out_tx.clone();
+        let reader = tokio::spawn(async move {
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        if let Ok(signal) = serde_json::from_str::<ServerSignal>(&text) {
+                            match signal {
+                                ServerSignal::ConnectRequest { session_id, offer }
+                                | ServerSignal::SignalingOffer { session_id, offer } => {
+                                    let _ = req_tx.send(ConnectionRequest { session_id, offer });
+                                }
+                                ServerSignal::Heartbeat => {
+                                    let hb = serde_json::json!({ "type": "heartbeat" });
+                                    let _ = reader_out.send(Message::Text(hb.to_string()));
+                                }
+                                _ => tracing::debug!("received signal: {:?}", signal),
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        tracing::warn!("server closed agent websocket connection");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        Ok((
+            Self {
+                outbound: out_tx,
+                tasks: vec![writer, reader],
+            },
+            req_rx,
+        ))
     }
 
-    /// Send an answer back to the client via the server.
-    pub async fn send_answer(&self, session_id: &str, answer: &str) -> Result<()> {
-        let url_with_token = format!("{}?token={}", self.url, urlencoding::encode(&self.token));
-        let (mut ws_stream, _) = connect_async(&url_with_token).await?;
-
+    /// Send an SDP answer back to the client via the server.
+    pub fn send_answer(&self, session_id: &str, answer: &str) -> Result<()> {
         let msg = serde_json::json!({
             "type": "signaling_answer",
             "session_id": session_id,
-            "answer": answer
+            "answer": answer,
         });
-
-        ws_stream.send(Message::Text(msg.to_string())).await?;
-        Ok(())
+        self.outbound
+            .send(Message::Text(msg.to_string()))
+            .context("agent websocket closed")
     }
 
     /// Send an ICE candidate to the client via the server.
-    pub async fn send_ice_candidate(&self, session_id: &str, candidate: &str) -> Result<()> {
-        let url_with_token = format!("{}?token={}", self.url, urlencoding::encode(&self.token));
-        let (mut ws_stream, _) = connect_async(&url_with_token).await?;
-
+    ///
+    /// Reserved for trickle ICE; the current flow uses non-trickle (candidates
+    /// embedded in the answer SDP), so this is not yet called.
+    #[allow(dead_code)]
+    pub fn send_ice_candidate(&self, session_id: &str, candidate: &str) -> Result<()> {
         let msg = serde_json::json!({
             "type": "ice_candidate",
             "session_id": session_id,
-            "candidate": candidate
+            "candidate": candidate,
         });
-
-        ws_stream.send(Message::Text(msg.to_string())).await?;
-        Ok(())
+        self.outbound
+            .send(Message::Text(msg.to_string()))
+            .context("agent websocket closed")
     }
 }
 
@@ -122,6 +135,15 @@ impl ServerClient {
 enum ServerSignal {
     #[serde(rename = "connect_request")]
     ConnectRequest { session_id: String, offer: String },
+    #[serde(rename = "signaling_offer")]
+    SignalingOffer { session_id: String, offer: String },
+    #[serde(rename = "ice_candidate")]
+    IceCandidate {
+        #[allow(dead_code)]
+        session_id: String,
+        #[allow(dead_code)]
+        candidate: String,
+    },
     #[serde(rename = "heartbeat")]
     Heartbeat,
     #[serde(rename = "machine_status")]

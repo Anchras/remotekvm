@@ -11,7 +11,6 @@
 
 use anyhow::Result;
 use egui_wgpu::ScreenDescriptor;
-use egui_winit::EventResponse;
 use winit::{
     event::Event,
     event_loop::{ControlFlow, EventLoop},
@@ -21,10 +20,12 @@ use winit::{
 mod app;
 mod auth;
 mod config;
+mod render;
 mod server_client;
-mod webrtc_client;
+mod signaling;
 
-use app::{App, AppState};
+use app::App;
+use config::Config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -36,6 +37,9 @@ async fn main() -> Result<()> {
         .init();
 
     tracing::info!("remotekvm-client starting");
+
+    let app_config = Config::from_env()?;
+    let rt_handle = tokio::runtime::Handle::current();
 
     let event_loop = EventLoop::new()?;
     let window = std::sync::Arc::new(
@@ -99,15 +103,15 @@ async fn main() -> Result<()> {
         None,
     );
 
-    let mut renderer = egui_wgpu::Renderer::new(
-        &device,
-        surface_format,
-        None,
-        1,
-    );
+    let mut renderer = egui_wgpu::Renderer::new(&device, surface_format, None, 1);
 
     // Initialize app state
-    let mut app = App::new();
+    let mut app = App::new(
+        app_config.server_url.clone(),
+        app_config.api_url.clone(),
+        app_config.ws_url.clone(),
+        rt_handle,
+    );
 
     // Event loop
     event_loop.run(move |event, window_target| {
@@ -115,10 +119,10 @@ async fn main() -> Result<()> {
 
         match event {
             Event::WindowEvent { event, .. } => {
-                let response = egui_state.on_window_event(&*window, &event);
-                if response.consumed {
-                    return;
-                }
+                // Feed the event to egui for input handling. We still act on
+                // Resized / CloseRequested / RedrawRequested below regardless of
+                // whether egui consumed it.
+                let _ = egui_state.on_window_event(&window, &event);
 
                 match event {
                     winit::event::WindowEvent::Resized(new_size) => {
@@ -131,78 +135,23 @@ async fn main() -> Result<()> {
                     winit::event::WindowEvent::CloseRequested => {
                         window_target.exit();
                     }
+                    winit::event::WindowEvent::RedrawRequested => {
+                        render_frame(
+                            &window,
+                            &surface,
+                            &device,
+                            &queue,
+                            &config,
+                            &egui_context,
+                            &mut egui_state,
+                            &mut renderer,
+                            &mut app,
+                        );
+                    }
                     _ => {}
                 }
             }
             Event::AboutToWait => {
-                window.request_redraw();
-            }
-            Event::WindowEvent {
-                event: winit::event::WindowEvent::RedrawRequested,
-                ..
-            } => {
-                let raw_input = egui_state.take_egui_input(&*window);
-                let egui_output = egui_context.run(raw_input, |ctx| {
-                    app.ui(ctx);
-                });
-
-                egui_state.handle_platform_output(&*window, egui_output.platform_output);
-
-                let clipped_primitives = egui_context.tessellate(
-                    egui_output.shapes,
-                    egui_output.pixels_per_point,
-                );
-
-                let screen_descriptor = ScreenDescriptor {
-                    size_in_pixels: [config.width, config.height],
-                    pixels_per_point: egui_output.pixels_per_point,
-                };
-
-                let frame = match surface.get_current_texture() {
-                    Ok(frame) => frame,
-                    Err(_) => {
-                        surface.configure(&device, &config);
-                        surface
-                            .get_current_texture()
-                            .expect("Failed to acquire next surface texture!")
-                    }
-                };
-
-                let view = frame
-                    .texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-
-                let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Render Encoder"),
-                });
-
-                {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("egui_render_pass"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color {
-                                    r: 0.1,
-                                    g: 0.1,
-                                    b: 0.1,
-                                    a: 1.0,
-                                }),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                    });
-
-                    renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
-                }
-
-                queue.submit(std::iter::once(encoder.finish()));
-                frame.present();
-
                 window.request_redraw();
             }
             _ => {}
@@ -210,4 +159,94 @@ async fn main() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+/// Run egui for one frame and present it via wgpu.
+#[allow(clippy::too_many_arguments)]
+fn render_frame(
+    window: &std::sync::Arc<winit::window::Window>,
+    surface: &wgpu::Surface,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    config: &wgpu::SurfaceConfiguration,
+    egui_context: &egui::Context,
+    egui_state: &mut egui_winit::State,
+    renderer: &mut egui_wgpu::Renderer,
+    app: &mut App,
+) {
+    let raw_input = egui_state.take_egui_input(window);
+    let egui_output = egui_context.run(raw_input, |ctx| {
+        app.ui(ctx);
+    });
+
+    egui_state.handle_platform_output(window, egui_output.platform_output);
+
+    let clipped_primitives =
+        egui_context.tessellate(egui_output.shapes, egui_output.pixels_per_point);
+
+    let screen_descriptor = ScreenDescriptor {
+        size_in_pixels: [config.width, config.height],
+        pixels_per_point: egui_output.pixels_per_point,
+    };
+
+    let frame = match surface.get_current_texture() {
+        Ok(frame) => frame,
+        Err(_) => {
+            surface.configure(device, config);
+            surface
+                .get_current_texture()
+                .expect("Failed to acquire next surface texture!")
+        }
+    };
+
+    let view = frame
+        .texture
+        .create_view(&wgpu::TextureViewDescriptor::default());
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Render Encoder"),
+    });
+
+    // egui-wgpu requires uploading buffers/textures before the render pass.
+    for (id, image_delta) in &egui_output.textures_delta.set {
+        renderer.update_texture(device, queue, *id, image_delta);
+    }
+    renderer.update_buffers(
+        device,
+        queue,
+        &mut encoder,
+        &clipped_primitives,
+        &screen_descriptor,
+    );
+
+    {
+        let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui_render_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.1,
+                        g: 0.1,
+                        b: 0.1,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+    }
+
+    for id in &egui_output.textures_delta.free {
+        renderer.free_texture(id);
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+    frame.present();
 }

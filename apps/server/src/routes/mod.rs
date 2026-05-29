@@ -1,6 +1,7 @@
 use axum::Json;
 use serde_json::Value;
 
+pub mod billing;
 pub mod machines;
 pub mod me;
 pub mod sessions;

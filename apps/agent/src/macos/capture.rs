@@ -41,7 +41,9 @@ impl Capturer {
         let displays: Retained<NSArray<SCDisplay>> = unsafe { content.displays() };
         let display: Retained<SCDisplay> = displays
             .first()
-            .ok_or_else(|| anyhow!("no displays available — is Screen Recording permission granted?"))?
+            .ok_or_else(|| {
+                anyhow!("no displays available — is Screen Recording permission granted?")
+            })?
             .retain();
 
         let filter: Retained<SCContentFilter> = unsafe {
@@ -50,7 +52,8 @@ impl Capturer {
             msg_send![alloc, initWithDisplay: &*display, excludingWindows: &*empty]
         };
 
-        let stream_config: Retained<SCStreamConfiguration> = unsafe { SCStreamConfiguration::new() };
+        let stream_config: Retained<SCStreamConfiguration> =
+            unsafe { SCStreamConfiguration::new() };
         unsafe {
             stream_config.setWidth(config.width as usize);
             stream_config.setHeight(config.height as usize);
@@ -75,10 +78,7 @@ impl Capturer {
         };
 
         let proto: &ProtocolObject<dyn SCStreamOutput> = ProtocolObject::from_ref(&*delegate);
-        let queue = DispatchQueue::new(
-            "io.adant.remotekvm.capture",
-            DispatchQueueAttr::SERIAL,
-        );
+        let queue = DispatchQueue::new("io.adant.remotekvm.capture", DispatchQueueAttr::SERIAL);
 
         unsafe {
             stream

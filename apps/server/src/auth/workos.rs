@@ -2,18 +2,19 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const WORKOS_API_BASE: &str = "https://api.workos.com";
-
 #[derive(Clone)]
 /// WorkOS API client.
 pub struct WorkOsClient {
     api_key: String,
     client_id: String,
+    api_base: String,
     http: reqwest::Client,
 }
 
 impl WorkOsClient {
-    pub fn new(api_key: String, client_id: String) -> Self {
+    /// Create a client. `api_base` is the WorkOS API root (e.g.
+    /// `https://api.workos.com`); integration tests point this at a local mock.
+    pub fn new(api_key: String, client_id: String, api_base: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -22,13 +23,14 @@ impl WorkOsClient {
         Self {
             api_key,
             client_id,
+            api_base,
             http,
         }
     }
 
     /// Exchange an authorization code for a user profile.
     pub async fn authenticate_with_code(&self, code: &str) -> Result<WorkOsUserProfile> {
-        let url = format!("{}/user_management/authenticate", WORKOS_API_BASE);
+        let url = format!("{}/user_management/authenticate", self.api_base);
 
         let response = self
             .http
