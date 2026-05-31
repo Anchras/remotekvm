@@ -10,14 +10,14 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread};
+use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass};
 use objc2_core_media::{CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamOutput, SCStreamOutputType,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::encode::Encoder;
 
@@ -35,16 +35,18 @@ pub struct Capturer {
     stream: Retained<SCStream>,
 }
 
+// SCStream callbacks are delivered on the serial dispatch queue we provide, and
+// session teardown is explicit via `stop`; keeping the guard in the async agent
+// task matches the current single-process macOS lifecycle.
+unsafe impl Send for Capturer {}
+
 impl Capturer {
     pub async fn start(config: CapturerConfig, encoder: Arc<Encoder>) -> Result<Self> {
         let content = get_shareable_content().await?;
         let displays: Retained<NSArray<SCDisplay>> = unsafe { content.displays() };
-        let display: Retained<SCDisplay> = displays
-            .first()
-            .ok_or_else(|| {
-                anyhow!("no displays available — is Screen Recording permission granted?")
-            })?
-            .retain();
+        let display: Retained<SCDisplay> = displays.firstObject().ok_or_else(|| {
+            anyhow!("no displays available — is Screen Recording permission granted?")
+        })?;
 
         let filter: Retained<SCContentFilter> = unsafe {
             let alloc = SCContentFilter::alloc();
@@ -60,7 +62,7 @@ impl Capturer {
             stream_config.setMinimumFrameInterval(CMTime {
                 value: 1,
                 timescale: config.fps as i32,
-                flags: objc2_core_media::CMTimeFlags::VALID,
+                flags: objc2_core_media::CMTimeFlags::Valid,
                 epoch: 0,
             });
             stream_config.setShowsCursor(true);
@@ -91,14 +93,14 @@ impl Capturer {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<Retained<NSError>>>();
-        let mut tx_cell = Some(tx);
+        let tx_cell = Mutex::new(Some(tx));
         let block = RcBlock::new(move |err: *mut NSError| {
             let retained = if err.is_null() {
                 None
             } else {
                 unsafe { Retained::retain(err) }
             };
-            if let Some(tx) = tx_cell.take() {
+            if let Some(tx) = tx_cell.lock().unwrap().take() {
                 let _ = tx.send(retained);
             }
         });
@@ -115,14 +117,14 @@ impl Capturer {
 
     pub async fn stop(self) -> Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel::<Option<Retained<NSError>>>();
-        let mut tx_cell = Some(tx);
+        let tx_cell = Mutex::new(Some(tx));
         let block = RcBlock::new(move |err: *mut NSError| {
             let retained = if err.is_null() {
                 None
             } else {
                 unsafe { Retained::retain(err) }
             };
-            if let Some(tx) = tx_cell.take() {
+            if let Some(tx) = tx_cell.lock().unwrap().take() {
                 let _ = tx.send(retained);
             }
         });
@@ -137,7 +139,7 @@ impl Capturer {
 async fn get_shareable_content() -> Result<Retained<SCShareableContent>> {
     let (tx, rx) =
         tokio::sync::oneshot::channel::<Result<Retained<SCShareableContent>, Retained<NSError>>>();
-    let mut tx_cell = Some(tx);
+    let tx_cell = Mutex::new(Some(tx));
     let block = RcBlock::new(move |content: *mut SCShareableContent, err: *mut NSError| {
         let result = if !err.is_null() {
             Err(unsafe { Retained::retain(err) }.expect("non-null NSError must retain"))
@@ -147,7 +149,7 @@ async fn get_shareable_content() -> Result<Retained<SCShareableContent>> {
             // Shouldn't happen per Apple's contract, but bail rather than panic.
             return;
         };
-        if let Some(tx) = tx_cell.take() {
+        if let Some(tx) = tx_cell.lock().unwrap().take() {
             let _ = tx.send(result);
         }
     });

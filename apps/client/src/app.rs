@@ -3,12 +3,14 @@ use std::sync::Arc;
 
 use egui::{Color32, Context, Visuals};
 use remotekvm_protocol::{ChannelMessage, InputEvent, MouseButton};
-use remotekvm_transport::PeerSession;
 use tokio::runtime::Handle;
 
-use crate::auth::{AuthFlow, LoopbackReceiver, TokenStore};
+use crate::auth::{
+    parse_deep_link, AuthFlow, DeepLink, LoopbackReceiver, TokenStore, DEEP_LINK_AUTH_URI,
+};
+use crate::render::VideoTexture;
 use crate::server_client::{ApiClient, UserProfile};
-use crate::signaling::establish_session;
+use crate::signaling::{establish_session, ClientSession};
 
 /// How long we wait for the user to finish the browser login before giving up.
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -23,12 +25,14 @@ pub struct App {
     server_url: String,
     api_url: String,
     ws_url: String,
+    use_deep_link_auth: bool,
     rt: Handle,
     /// Pending background results, polled each frame.
     auth_rx: Option<Receiver<AuthMsg>>,
     connect_rx: Option<Receiver<ConnectMsg>>,
     /// The connected WebRTC session, once established. Input is forwarded here.
-    active_session: Option<Arc<PeerSession>>,
+    active_session: Option<Arc<ClientSession>>,
+    video_texture: VideoTexture,
 }
 
 #[derive(Clone, PartialEq)]
@@ -76,13 +80,19 @@ enum AuthMsg {
 enum ConnectMsg {
     Success {
         session_id: String,
-        session: Arc<PeerSession>,
+        session: Arc<ClientSession>,
     },
     Failure(String),
 }
 
 impl App {
-    pub fn new(server_url: String, api_url: String, ws_url: String, rt: Handle) -> Self {
+    pub fn new(
+        server_url: String,
+        api_url: String,
+        ws_url: String,
+        use_deep_link_auth: bool,
+        rt: Handle,
+    ) -> Self {
         let mut app = Self {
             state: AppState::Login,
             auth_token: None,
@@ -92,10 +102,12 @@ impl App {
             server_url,
             api_url,
             ws_url,
+            use_deep_link_auth,
             rt,
             auth_rx: None,
             connect_rx: None,
             active_session: None,
+            video_texture: VideoTexture::default(),
         };
 
         // Auto-resume if a session token is already stored in the OS keychain.
@@ -106,6 +118,25 @@ impl App {
         }
 
         app
+    }
+
+    pub fn handle_deep_link_url(&mut self, raw_url: &str) {
+        match parse_deep_link(raw_url) {
+            Ok(DeepLink::AuthToken(token)) => {
+                tracing::info!("received auth token from remotekvm:// deep link");
+                self.teardown_session();
+                self.auth_token = Some(token.clone());
+                self.auth_rx = Some(self.spawn_fetch(token));
+                self.error_message = None;
+                self.state = AppState::Authenticating;
+            }
+            Err(e) => {
+                let msg = format!("could not handle deep link: {e}");
+                tracing::warn!(error = %e, "deep link rejected");
+                self.error_message = Some(msg.clone());
+                self.state = AppState::Error(msg);
+            }
+        }
     }
 
     /// Spawn a background task that fetches the user + machine list for a token.
@@ -333,18 +364,36 @@ impl App {
 
     fn connected_ui(&mut self, ctx: &Context) {
         // Forward this frame's mouse/keyboard input to the host over the
-        // control channel. (Video decode → wgpu texture is the next milestone.)
+        // control channel.
         self.forward_input(ctx);
+        let latest_frame = self
+            .active_session
+            .as_ref()
+            .and_then(|session| session.latest_video_frame());
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(100.0);
-                ui.heading("Connected");
-                ui.add_space(20.0);
-                ui.label("Input is being forwarded. Video stream will appear here.");
-                ui.add_space(20.0);
-                if ui.button("Disconnect").clicked() {
-                    self.disconnect();
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Connected");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Disconnect").clicked() {
+                            self.disconnect();
+                        }
+                    });
+                });
+                ui.separator();
+
+                if let Some(frame) = latest_frame.as_ref() {
+                    if let Err(error) = self.video_texture.show_frame(ui, frame) {
+                        tracing::warn!(%error, "failed to upload decoded video frame");
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Decoded video frame could not be displayed.");
+                        });
+                    }
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Waiting for remote video...");
+                    });
                 }
             });
         });
@@ -373,6 +422,16 @@ impl App {
     fn start_auth(&mut self) {
         self.error_message = None;
 
+        let flow = AuthFlow::new(&self.server_url);
+        if self.use_deep_link_auth {
+            if let Err(e) = flow.open_browser(DEEP_LINK_AUTH_URI) {
+                self.error_message = Some(format!("could not open browser: {e}"));
+                return;
+            }
+            self.state = AppState::Authenticating;
+            return;
+        }
+
         // Synchronous bind — safe to call from the egui frame even though we're
         // inside a Tokio context (no `block_on`, which would panic here).
         let receiver = match LoopbackReceiver::bind() {
@@ -384,7 +443,6 @@ impl App {
         };
         let redirect_uri = receiver.redirect_uri();
 
-        let flow = AuthFlow::new(&self.server_url);
         if let Err(e) = flow.open_browser(&redirect_uri) {
             self.error_message = Some(format!("could not open browser: {e}"));
             return;
@@ -495,7 +553,7 @@ async fn connect_and_establish(
     ws_url: &str,
     token: &str,
     machine_id: &str,
-) -> anyhow::Result<(String, PeerSession)> {
+) -> anyhow::Result<(String, ClientSession)> {
     let resp = client.connect_machine(machine_id).await?;
     let session = establish_session(ws_url, token, &resp.session_id).await?;
     Ok((resp.session_id, session))

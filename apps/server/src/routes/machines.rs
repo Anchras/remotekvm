@@ -75,18 +75,22 @@ pub async fn register_machine(
         .user_id()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Validate organization_id if provided
+    // Validate organization_id if provided. Attaching a machine to an
+    // organization makes it visible/connectable to the whole team, so it uses
+    // the same owner/admin gate as the explicit share endpoint.
     if let Some(org_id) = req.organization_id {
-        let is_member = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM organization_members WHERE organization_id = $1 AND user_id = $2)"
+        let role = sqlx::query_scalar::<_, String>(
+            "SELECT role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
         )
         .bind(org_id)
         .bind(user_id)
-        .fetch_one(state.db.pool())
+        .fetch_optional(state.db.pool())
         .await?;
 
-        if !is_member {
-            return Err(ApiError::Forbidden);
+        match role.as_deref() {
+            Some("owner") | Some("admin") => {}
+            Some(_) => return Err(ApiError::Forbidden),
+            None => return Err(ApiError::NotFound("organization not found".to_string())),
         }
     }
 

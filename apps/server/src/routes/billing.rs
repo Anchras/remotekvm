@@ -6,12 +6,12 @@
 
 use axum::{
     body::Bytes,
-    extract::{Extension, State},
+    extract::{Extension, Json as ExtractJson, State},
     http::HeaderMap,
     response::Json,
 };
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::sync::Arc;
@@ -28,6 +28,7 @@ const WEBHOOK_TOLERANCE_SECS: i64 = 300;
 pub async fn create_checkout(
     Extension(claims): Extension<Claims>,
     State(state): State<Arc<AppState>>,
+    maybe_req: Option<ExtractJson<CheckoutRequest>>,
 ) -> Result<Json<CheckoutResponse>, ApiError> {
     let cfg = &state.config;
     if cfg.stripe_secret_key.is_empty() || cfg.stripe_price_id.is_empty() {
@@ -38,13 +39,15 @@ pub async fn create_checkout(
     let user_id = claims
         .user_id()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let req = maybe_req.map(|ExtractJson(req)| req).unwrap_or_default();
+    let target = CheckoutTarget::load(&state, user_id, req.organization_id).await?;
 
     // Stripe's API is form-encoded. We tie the session to our user via
     // `client_reference_id` so the webhook can attribute it back.
-    let params = [
+    let mut params = vec![
         ("mode", "subscription".to_string()),
         ("line_items[0][price]", cfg.stripe_price_id.clone()),
-        ("line_items[0][quantity]", "1".to_string()),
+        ("line_items[0][quantity]", target.quantity.to_string()),
         ("client_reference_id", user_id.to_string()),
         (
             "success_url",
@@ -55,6 +58,13 @@ pub async fn create_checkout(
             format!("{}/billing/cancel", cfg.public_base_url),
         ),
     ];
+    if let Some(org_id) = target.organization_id {
+        params.push(("metadata[organization_id]", org_id.to_string()));
+        params.push((
+            "subscription_data[metadata][organization_id]",
+            org_id.to_string(),
+        ));
+    }
 
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/checkout/sessions", cfg.stripe_api_base))
@@ -79,6 +89,76 @@ pub async fn create_checkout(
         .to_string();
 
     Ok(Json(CheckoutResponse { url }))
+}
+
+/// `GET /api/billing/usage` — current-month usage for the user and orgs.
+pub async fn usage(
+    Extension(claims): Extension<Claims>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<UsageResponse>, ApiError> {
+    let user_id = claims
+        .user_id()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    let personal = sqlx::query_as::<_, UsageRow>(
+        r#"
+        SELECT
+            COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, NOW()) - s.started_at)))::BIGINT, 0) AS connection_seconds,
+            COALESCE(SUM(s.bytes_sent), 0)::BIGINT AS bytes_sent,
+            COALESCE(SUM(s.bytes_received), 0)::BIGINT AS bytes_received
+        FROM sessions s
+        JOIN machines m ON m.id = s.machine_id
+        WHERE m.user_id = $1
+          AND m.organization_id IS NULL
+          AND s.started_at >= date_trunc('month', NOW())
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(state.db.pool())
+    .await?;
+
+    let orgs = sqlx::query_as::<_, OrgUsageRow>(
+        r#"
+        SELECT
+            o.id AS organization_id,
+            o.name AS organization_name,
+            o.plan,
+            o.seat_count,
+            COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, NOW()) - s.started_at)))::BIGINT, 0) AS connection_seconds,
+            COALESCE(SUM(s.bytes_sent), 0)::BIGINT AS bytes_sent,
+            COALESCE(SUM(s.bytes_received), 0)::BIGINT AS bytes_received
+        FROM organizations o
+        JOIN organization_members om ON om.organization_id = o.id
+        LEFT JOIN machines m ON m.organization_id = o.id
+        LEFT JOIN sessions s ON s.machine_id = m.id AND s.started_at >= date_trunc('month', NOW())
+        WHERE om.user_id = $1
+        GROUP BY o.id, o.name, o.plan, o.seat_count
+        ORDER BY o.name ASC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(state.db.pool())
+    .await?;
+
+    Ok(Json(UsageResponse {
+        personal: UsageBucket::from_row("personal".to_string(), "free".to_string(), 1, personal),
+        organizations: orgs
+            .into_iter()
+            .map(|row| {
+                UsageBucket::from_row(
+                    row.organization_id.to_string(),
+                    row.plan,
+                    row.seat_count,
+                    UsageRow {
+                        connection_seconds: row.connection_seconds,
+                        bytes_sent: row.bytes_sent,
+                        bytes_received: row.bytes_received,
+                    },
+                )
+                .with_name(row.organization_name)
+            })
+            .collect(),
+    }))
 }
 
 /// `POST /webhooks/stripe` — verify the signature and apply subscription events.
@@ -109,10 +189,30 @@ pub async fn stripe_webhook(
     match event_type {
         // The user completed checkout: persist their Stripe customer id.
         "checkout.session.completed" => {
-            if let (Some(user_id), Some(customer)) = (
-                object["client_reference_id"].as_str(),
-                object["customer"].as_str(),
-            ) {
+            let customer = object["customer"].as_str();
+            let subscription = object["subscription"].as_str();
+            let org_id = object["metadata"]["organization_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok());
+
+            if let (Some(org_id), Some(customer)) = (org_id, customer) {
+                sqlx::query(
+                    r#"
+                    UPDATE organizations
+                    SET stripe_customer_id = $1,
+                        stripe_subscription_id = COALESCE($2, stripe_subscription_id),
+                        plan = 'team'
+                    WHERE id = $3
+                    "#,
+                )
+                .bind(customer)
+                .bind(subscription)
+                .bind(org_id)
+                .execute(state.db.pool())
+                .await?;
+            } else if let (Some(user_id), Some(customer)) =
+                (object["client_reference_id"].as_str(), customer)
+            {
                 if let Ok(uid) = uuid::Uuid::parse_str(user_id) {
                     sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
                         .bind(customer)
@@ -120,6 +220,19 @@ pub async fn stripe_webhook(
                         .execute(state.db.pool())
                         .await?;
                 }
+            }
+        }
+        "customer.subscription.deleted" => {
+            if let Some(org_id) = object["metadata"]["organization_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok())
+            {
+                sqlx::query(
+                    "UPDATE organizations SET stripe_subscription_id = NULL, plan = 'free' WHERE id = $1",
+                )
+                .bind(org_id)
+                .execute(state.db.pool())
+                .await?;
             }
         }
         other => tracing::debug!(event = other, "unhandled Stripe event"),
@@ -205,6 +318,117 @@ fn now_unix() -> i64 {
 #[derive(Debug, Serialize)]
 pub struct CheckoutResponse {
     pub url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CheckoutRequest {
+    pub organization_id: Option<uuid::Uuid>,
+}
+
+struct CheckoutTarget {
+    organization_id: Option<uuid::Uuid>,
+    quantity: i64,
+}
+
+impl CheckoutTarget {
+    async fn load(
+        state: &AppState,
+        user_id: uuid::Uuid,
+        organization_id: Option<uuid::Uuid>,
+    ) -> Result<Self, ApiError> {
+        let Some(org_id) = organization_id else {
+            return Ok(Self {
+                organization_id: None,
+                quantity: 1,
+            });
+        };
+
+        let role = sqlx::query_scalar::<_, String>(
+            "SELECT role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .fetch_optional(state.db.pool())
+        .await?;
+        match role.as_deref() {
+            Some("owner") | Some("admin") => {}
+            Some(_) => return Err(ApiError::Forbidden),
+            None => return Err(ApiError::NotFound("organization not found".to_string())),
+        }
+
+        let quantity = sqlx::query_scalar::<_, i64>(
+            "SELECT GREATEST(COUNT(*), 1)::BIGINT FROM organization_members WHERE organization_id = $1",
+        )
+        .bind(org_id)
+        .fetch_one(state.db.pool())
+        .await?;
+        sqlx::query("UPDATE organizations SET seat_count = $1 WHERE id = $2")
+            .bind(quantity as i32)
+            .bind(org_id)
+            .execute(state.db.pool())
+            .await?;
+
+        Ok(Self {
+            organization_id: Some(org_id),
+            quantity,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageResponse {
+    pub personal: UsageBucket,
+    pub organizations: Vec<UsageBucket>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageBucket {
+    pub id: String,
+    pub name: Option<String>,
+    pub plan: String,
+    pub seat_count: i32,
+    pub connection_seconds: i64,
+    pub connection_minutes: i64,
+    pub bytes_sent: i64,
+    pub bytes_received: i64,
+}
+
+impl UsageBucket {
+    fn from_row(id: String, plan: String, seat_count: i32, row: UsageRow) -> Self {
+        Self {
+            id,
+            name: None,
+            plan,
+            seat_count,
+            connection_seconds: row.connection_seconds,
+            connection_minutes: row.connection_seconds.div_euclid(60),
+            bytes_sent: row.bytes_sent,
+            bytes_received: row.bytes_received,
+        }
+    }
+
+    fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct UsageRow {
+    connection_seconds: i64,
+    bytes_sent: i64,
+    bytes_received: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct OrgUsageRow {
+    organization_id: uuid::Uuid,
+    organization_name: String,
+    plan: String,
+    seat_count: i32,
+    connection_seconds: i64,
+    bytes_sent: i64,
+    bytes_received: i64,
 }
 
 #[cfg(test)]

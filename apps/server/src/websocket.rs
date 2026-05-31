@@ -5,25 +5,29 @@ use axum::{
     },
     response::Response,
 };
+use redis::{aio::ConnectionManager, AsyncCommands};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use crate::auth::validate_token;
+use crate::config::Config;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 const WS_CHANNEL_SIZE: usize = 64;
+const REDIS_KEY_PREFIX: &str = "remotekvm:signaling";
 
 /// A registered agent socket: its forward channel plus a unique connection id
 /// so a reconnecting agent doesn't get torn down by the old socket's cleanup.
 type AgentEntry = (u64, tokio::sync::mpsc::Sender<SignalingMessage>);
 
 /// Shared state for WebSocket connections.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct SignalingState {
     /// Map of machine_id -> (connection id, agent WebSocket sender)
     agents: Arc<RwLock<HashMap<String, AgentEntry>>>,
@@ -31,11 +35,62 @@ pub struct SignalingState {
     clients: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<SignalingMessage>>>>,
     /// Monotonic source of per-connection ids.
     next_conn_id: Arc<std::sync::atomic::AtomicU64>,
+    instance_id: String,
+    redis: Option<RedisSignalingStore>,
+}
+
+#[derive(Clone)]
+struct RedisSignalingStore {
+    connection: ConnectionManager,
+    instance_id: String,
+    ttl_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct AgentPresence {
+    instance_id: String,
+    conn_id: u64,
 }
 
 impl SignalingState {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            agents: Arc::new(RwLock::new(HashMap::new())),
+            clients: Arc::new(RwLock::new(HashMap::new())),
+            next_conn_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            instance_id: format!("local-{}", uuid::Uuid::new_v4()),
+            redis: None,
+        }
+    }
+
+    pub async fn from_config(config: &Config) -> anyhow::Result<Self> {
+        let mut state = Self {
+            instance_id: config.signaling_instance_id.clone(),
+            ..Self::new()
+        };
+
+        if let Some(redis_url) = &config.redis_url {
+            state.redis = Some(
+                RedisSignalingStore::connect(
+                    redis_url,
+                    config.signaling_instance_id.clone(),
+                    config.signaling_ttl_seconds,
+                )
+                .await?,
+            );
+            info!(
+                instance_id = %config.signaling_instance_id,
+                ttl_seconds = config.signaling_ttl_seconds,
+                "redis signaling metadata enabled"
+            );
+        } else {
+            info!(
+                instance_id = %config.signaling_instance_id,
+                "redis signaling metadata disabled; using process-local signaling state"
+            );
+        }
+
+        Ok(state)
     }
 
     fn next_conn_id(&self) -> u64 {
@@ -43,13 +98,30 @@ impl SignalingState {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Whether an agent for `machine_id` currently holds a live signaling socket.
+    /// Whether an agent for `machine_id` currently holds a live socket in this
+    /// process.
     ///
-    /// This reflects the in-memory relay state, which is the real source of
-    /// truth for "can we signal this machine right now" — the `machines.online`
-    /// DB column can lag if an agent died without a clean WebSocket close.
+    /// Redis, when configured, stores cross-instance presence/routing metadata,
+    /// but the actual WebSocket sender channel is still process-local. Until the
+    /// relay has Redis/NATS pub-sub forwarding or strict load-balancer affinity,
+    /// this local check remains the safe source of truth for "can this process
+    /// signal this machine right now".
     pub async fn is_agent_online(&self, machine_id: &str) -> bool {
-        self.agents.read().await.contains_key(machine_id)
+        if self.agents.read().await.contains_key(machine_id) {
+            return true;
+        }
+
+        if let Some(presence) = self.redis_agent_presence(machine_id).await {
+            warn!(
+                machine_id,
+                agent_instance_id = %presence.instance_id,
+                agent_conn_id = presence.conn_id,
+                local_instance_id = %self.instance_id,
+                "agent is present in redis on another instance, but websocket relay is process-local"
+            );
+        }
+
+        false
     }
 
     /// Push a message to a connected agent.
@@ -63,6 +135,289 @@ impl SignalingState {
             None => false,
         }
     }
+
+    async fn register_agent(
+        &self,
+        machine_id: &str,
+        conn_id: u64,
+        tx: tokio::sync::mpsc::Sender<SignalingMessage>,
+    ) {
+        {
+            let mut agents = self.agents.write().await;
+            agents.insert(machine_id.to_string(), (conn_id, tx));
+        }
+
+        if let Some(redis) = &self.redis {
+            if let Err(e) = redis.set_agent_online(machine_id, conn_id).await {
+                warn!(error = %e, machine_id, "failed to persist agent presence in redis");
+            }
+        }
+    }
+
+    async fn refresh_agent(&self, machine_id: &str, conn_id: u64) {
+        if let Some(redis) = &self.redis {
+            if let Err(e) = redis.refresh_agent(machine_id, conn_id).await {
+                warn!(error = %e, machine_id, "failed to refresh agent presence in redis");
+            }
+        }
+    }
+
+    async fn unregister_agent_if_current(&self, machine_id: &str, conn_id: u64) -> bool {
+        let was_current = {
+            let mut agents = self.agents.write().await;
+            match agents.get(machine_id) {
+                Some((id, _)) if *id == conn_id => {
+                    agents.remove(machine_id);
+                    true
+                }
+                _ => false,
+            }
+        };
+
+        if was_current {
+            if let Some(redis) = &self.redis {
+                if let Err(e) = redis.clear_agent(machine_id, conn_id).await {
+                    warn!(error = %e, machine_id, "failed to clear agent presence from redis");
+                }
+            }
+        }
+
+        was_current
+    }
+
+    pub async fn record_session_route(&self, session_id: &str, machine_id: &str, user_id: &str) {
+        if let Some(redis) = &self.redis {
+            let agent_instance_id = self
+                .redis_agent_presence(machine_id)
+                .await
+                .map(|presence| presence.instance_id)
+                .unwrap_or_else(|| self.instance_id.clone());
+            if let Err(e) = redis
+                .set_session_route(session_id, machine_id, user_id, &agent_instance_id)
+                .await
+            {
+                warn!(error = %e, session_id, "failed to persist session route in redis");
+            }
+        }
+    }
+
+    async fn register_client_session(
+        &self,
+        session_id: &str,
+        machine_id: &str,
+        user_id: &str,
+        tx: tokio::sync::mpsc::Sender<SignalingMessage>,
+    ) {
+        {
+            let mut clients = self.clients.write().await;
+            clients.insert(session_id.to_string(), tx);
+        }
+
+        if let Some(redis) = &self.redis {
+            let agent_instance_id = self
+                .redis_agent_presence(machine_id)
+                .await
+                .map(|presence| presence.instance_id)
+                .unwrap_or_else(|| self.instance_id.clone());
+            if let Err(e) = redis
+                .set_session_route(session_id, machine_id, user_id, &agent_instance_id)
+                .await
+            {
+                warn!(error = %e, session_id, "failed to refresh session route in redis");
+            }
+        }
+    }
+
+    async fn unregister_client_sessions(&self, session_ids: &[String]) {
+        {
+            let mut clients = self.clients.write().await;
+            for session_id in session_ids {
+                clients.remove(session_id);
+            }
+        }
+
+        if let Some(redis) = &self.redis {
+            for session_id in session_ids {
+                if let Err(e) = redis.clear_session_route(session_id).await {
+                    warn!(error = %e, session_id, "failed to clear session route from redis");
+                }
+            }
+        }
+    }
+
+    async fn send_to_client(&self, session_id: &str, msg: SignalingMessage) -> bool {
+        let clients = self.clients.read().await;
+        match clients.get(session_id) {
+            Some(tx) => tx.send(msg).await.is_ok(),
+            None => false,
+        }
+    }
+
+    async fn redis_agent_presence(&self, machine_id: &str) -> Option<AgentPresence> {
+        let redis = self.redis.as_ref()?;
+        match redis.agent_presence(machine_id).await {
+            Ok(presence) => presence,
+            Err(e) => {
+                warn!(error = %e, machine_id, "failed to read agent presence from redis");
+                None
+            }
+        }
+    }
+}
+
+impl RedisSignalingStore {
+    async fn connect(url: &str, instance_id: String, ttl_seconds: u64) -> anyhow::Result<Self> {
+        let client = redis::Client::open(url)?;
+        let connection = ConnectionManager::new(client).await?;
+        Ok(Self {
+            connection,
+            instance_id,
+            ttl_seconds,
+        })
+    }
+
+    async fn set_agent_online(&self, machine_id: &str, conn_id: u64) -> redis::RedisResult<()> {
+        let key = agent_key(machine_id);
+        let now = now_millis();
+        let mut conn = self.connection.clone();
+        redis::pipe()
+            .atomic()
+            .cmd("HSET")
+            .arg(&key)
+            .arg("machine_id")
+            .arg(machine_id)
+            .arg("instance_id")
+            .arg(&self.instance_id)
+            .arg("conn_id")
+            .arg(conn_id)
+            .arg("connected_at_ms")
+            .arg(now)
+            .arg("last_seen_ms")
+            .arg(now)
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(self.ttl_seconds)
+            .query_async::<_, ()>(&mut conn)
+            .await
+    }
+
+    async fn refresh_agent(&self, machine_id: &str, conn_id: u64) -> redis::RedisResult<()> {
+        let key = agent_key(machine_id);
+        let mut conn = self.connection.clone();
+        let _: i32 = redis::Script::new(
+            r#"
+            if redis.call("HGET", KEYS[1], "instance_id") == ARGV[1]
+              and redis.call("HGET", KEYS[1], "conn_id") == ARGV[2] then
+              redis.call("HSET", KEYS[1], "last_seen_ms", ARGV[3])
+              redis.call("EXPIRE", KEYS[1], ARGV[4])
+              return 1
+            end
+            return 0
+            "#,
+        )
+        .key(key)
+        .arg(&self.instance_id)
+        .arg(conn_id.to_string())
+        .arg(now_millis().to_string())
+        .arg(self.ttl_seconds.to_string())
+        .invoke_async(&mut conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_agent(&self, machine_id: &str, conn_id: u64) -> redis::RedisResult<()> {
+        let key = agent_key(machine_id);
+        let mut conn = self.connection.clone();
+        let _: i32 = redis::Script::new(
+            r#"
+            if redis.call("HGET", KEYS[1], "instance_id") == ARGV[1]
+              and redis.call("HGET", KEYS[1], "conn_id") == ARGV[2] then
+              return redis.call("DEL", KEYS[1])
+            end
+            return 0
+            "#,
+        )
+        .key(key)
+        .arg(&self.instance_id)
+        .arg(conn_id.to_string())
+        .invoke_async(&mut conn)
+        .await?;
+        Ok(())
+    }
+
+    async fn agent_presence(&self, machine_id: &str) -> redis::RedisResult<Option<AgentPresence>> {
+        let key = agent_key(machine_id);
+        let mut conn = self.connection.clone();
+        let fields: HashMap<String, String> = conn.hgetall(key).await?;
+        if fields.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(instance_id) = fields.get("instance_id").cloned() else {
+            return Ok(None);
+        };
+        let conn_id = fields
+            .get("conn_id")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default();
+
+        Ok(Some(AgentPresence {
+            instance_id,
+            conn_id,
+        }))
+    }
+
+    async fn set_session_route(
+        &self,
+        session_id: &str,
+        machine_id: &str,
+        user_id: &str,
+        agent_instance_id: &str,
+    ) -> redis::RedisResult<()> {
+        let key = session_key(session_id);
+        let mut conn = self.connection.clone();
+        redis::pipe()
+            .atomic()
+            .cmd("HSET")
+            .arg(&key)
+            .arg("session_id")
+            .arg(session_id)
+            .arg("machine_id")
+            .arg(machine_id)
+            .arg("user_id")
+            .arg(user_id)
+            .arg("agent_instance_id")
+            .arg(agent_instance_id)
+            .arg("client_instance_id")
+            .arg(&self.instance_id)
+            .arg("updated_at_ms")
+            .arg(now_millis())
+            .cmd("EXPIRE")
+            .arg(&key)
+            .arg(self.ttl_seconds)
+            .query_async::<_, ()>(&mut conn)
+            .await
+    }
+
+    async fn clear_session_route(&self, session_id: &str) -> redis::RedisResult<()> {
+        let mut conn = self.connection.clone();
+        conn.del(session_key(session_id)).await
+    }
+}
+
+fn agent_key(machine_id: &str) -> String {
+    format!("{REDIS_KEY_PREFIX}:agent:{machine_id}")
+}
+
+fn session_key(session_id: &str) -> String {
+    format!("{REDIS_KEY_PREFIX}:session:{session_id}")
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -141,18 +496,25 @@ async fn handle_agent_socket(mut socket: WebSocket, state: Arc<AppState>, machin
     // reconnected for the same machine while this one was tearing down.
     let conn_id = state.signaling.next_conn_id();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<SignalingMessage>(WS_CHANNEL_SIZE);
-    {
-        let mut agents = state.signaling.agents.write().await;
-        agents.insert(machine_id.to_string(), (conn_id, tx));
-    }
+    state
+        .signaling
+        .register_agent(&machine_id.to_string(), conn_id, tx)
+        .await;
+    let mut presence_refresh = tokio::time::interval(Duration::from_secs(
+        state.config.signaling_ttl_seconds.saturating_div(3).max(10),
+    ));
+    presence_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     // Main loop: read from socket and from the forward channel
     loop {
         tokio::select! {
+            _ = presence_refresh.tick() => {
+                state.signaling.refresh_agent(&machine_id.to_string(), conn_id).await;
+            }
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(e) = handle_agent_message(&text, &machine_id.to_string(), &state).await {
+                        if let Err(e) = handle_agent_message(&text, &machine_id.to_string(), conn_id, &state).await {
                             warn!(error = %e, "failed to handle agent message");
                         }
                     }
@@ -191,16 +553,10 @@ async fn handle_agent_socket(mut socket: WebSocket, state: Arc<AppState>, machin
     // Cleanup: only tear down the relay slot / mark offline if it's still *our*
     // connection. A newer socket may have reconnected for this machine while we
     // were shutting down; in that case leave its registration intact.
-    let was_current = {
-        let mut agents = state.signaling.agents.write().await;
-        match agents.get(&machine_id.to_string()) {
-            Some((id, _)) if *id == conn_id => {
-                agents.remove(&machine_id.to_string());
-                true
-            }
-            _ => false,
-        }
-    };
+    let was_current = state
+        .signaling
+        .unregister_agent_if_current(&machine_id.to_string(), conn_id)
+        .await;
 
     if was_current {
         if let Err(e) = sqlx::query("UPDATE machines SET online = false WHERE id = $1")
@@ -209,6 +565,9 @@ async fn handle_agent_socket(mut socket: WebSocket, state: Arc<AppState>, machin
             .await
         {
             error!(error = %e, "failed to mark machine as offline");
+        }
+        if let Err(e) = end_machine_sessions(&state, machine_id).await {
+            error!(error = %e, "failed to end machine sessions");
         }
     }
 
@@ -233,42 +592,49 @@ async fn validate_agent_token(token: &str, state: &AppState) -> Option<uuid::Uui
 
 async fn handle_agent_message(
     text: &str,
-    _machine_id: &str,
+    machine_id: &str,
+    conn_id: u64,
     state: &AppState,
 ) -> anyhow::Result<()> {
     let msg: SignalingMessage = serde_json::from_str(text)?;
 
     match msg {
         SignalingMessage::SignalingAnswer { session_id, answer } => {
+            mark_session_active(state, &session_id).await?;
+            record_session_usage(state, &session_id, text.len() as i64, 0).await?;
             // Forward answer to the client
-            let clients = state.signaling.clients.read().await;
-            if let Some(client_tx) = clients.get(&session_id) {
-                let _ = client_tx
-                    .send(SignalingMessage::ConnectResponse {
+            let _ = state
+                .signaling
+                .send_to_client(
+                    &session_id,
+                    SignalingMessage::ConnectResponse {
                         session_id: session_id.clone(),
                         status: "accepted".to_string(),
                         answer: Some(answer),
-                    })
-                    .await;
-            }
+                    },
+                )
+                .await;
         }
         SignalingMessage::IceCandidate {
             session_id,
             candidate,
         } => {
+            record_session_usage(state, &session_id, text.len() as i64, 0).await?;
             // Forward ICE candidate to the client
-            let clients = state.signaling.clients.read().await;
-            if let Some(client_tx) = clients.get(&session_id) {
-                let _ = client_tx
-                    .send(SignalingMessage::IceCandidate {
-                        session_id,
+            let _ = state
+                .signaling
+                .send_to_client(
+                    &session_id,
+                    SignalingMessage::IceCandidate {
+                        session_id: session_id.clone(),
                         candidate,
-                    })
-                    .await;
-            }
+                    },
+                )
+                .await;
         }
         SignalingMessage::Heartbeat => {
             // Heartbeat received, agent is alive
+            state.signaling.refresh_agent(machine_id, conn_id).await;
             info!("agent heartbeat");
         }
         _ => {
@@ -352,10 +718,13 @@ async fn handle_client_socket(mut socket: WebSocket, state: Arc<AppState>, user_
     }
 
     // Cleanup: remove only this client's owned sessions
-    {
-        let mut clients = state.signaling.clients.write().await;
-        for session_id in owned_sessions {
-            clients.remove(&session_id);
+    state
+        .signaling
+        .unregister_client_sessions(&owned_sessions)
+        .await;
+    for session_id in owned_sessions {
+        if let Err(e) = mark_session_ended(&state, &session_id).await {
+            warn!(error = %e, session_id = %session_id, "failed to end client session");
         }
     }
 
@@ -390,23 +759,30 @@ async fn handle_client_message(
                 }
 
                 // Register client for this session
-                {
-                    let mut clients = state.signaling.clients.write().await;
-                    clients.insert(session_id.clone(), client_tx.clone());
-                    owned_sessions.push(session_id.clone());
-                }
+                state
+                    .signaling
+                    .register_client_session(
+                        &session_id,
+                        &session.machine_id.to_string(),
+                        user_id,
+                        client_tx.clone(),
+                    )
+                    .await;
+                owned_sessions.push(session_id.clone());
+                record_session_usage(state, &session_id, 0, text.len() as i64).await?;
 
                 // Forward to agent
-                let agents = state.signaling.agents.read().await;
-                if let Some((_, agent_tx)) = agents.get(&session.machine_id.to_string()) {
-                    let _ = agent_tx
-                        .send(SignalingMessage::ConnectRequest {
+                let _ = state
+                    .signaling
+                    .notify_agent(
+                        &session.machine_id.to_string(),
+                        SignalingMessage::ConnectRequest {
                             session_id: session_id.clone(),
                             client_id: user_id.to_string(),
                             offer,
-                        })
-                        .await;
-                }
+                        },
+                    )
+                    .await;
             }
         }
         SignalingMessage::SignalingOffer { session_id, offer } => {
@@ -424,13 +800,16 @@ async fn handle_client_message(
                     return Ok(());
                 }
 
+                record_session_usage(state, &session_id, 0, text.len() as i64).await?;
+
                 // Forward offer to agent
-                let agents = state.signaling.agents.read().await;
-                if let Some((_, agent_tx)) = agents.get(&session.machine_id.to_string()) {
-                    let _ = agent_tx
-                        .send(SignalingMessage::SignalingOffer { session_id, offer })
-                        .await;
-                }
+                let _ = state
+                    .signaling
+                    .notify_agent(
+                        &session.machine_id.to_string(),
+                        SignalingMessage::SignalingOffer { session_id, offer },
+                    )
+                    .await;
             }
         }
         SignalingMessage::IceCandidate {
@@ -451,16 +830,19 @@ async fn handle_client_message(
                     return Ok(());
                 }
 
+                record_session_usage(state, &session_id, 0, text.len() as i64).await?;
+
                 // Forward ICE candidate to agent
-                let agents = state.signaling.agents.read().await;
-                if let Some((_, agent_tx)) = agents.get(&session.machine_id.to_string()) {
-                    let _ = agent_tx
-                        .send(SignalingMessage::IceCandidate {
+                let _ = state
+                    .signaling
+                    .notify_agent(
+                        &session.machine_id.to_string(),
+                        SignalingMessage::IceCandidate {
                             session_id,
                             candidate,
-                        })
-                        .await;
-                }
+                        },
+                    )
+                    .await;
             }
         }
         _ => {
@@ -480,4 +862,68 @@ struct MachineIdRow {
 struct SessionOwnerRow {
     user_id: uuid::Uuid,
     machine_id: uuid::Uuid,
+}
+
+async fn mark_session_active(state: &AppState, session_id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sessions
+        SET status = 'active'
+        WHERE id = $1 AND status = 'pending'
+        "#,
+    )
+    .bind(uuid::Uuid::parse_str(session_id)?)
+    .execute(state.db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn record_session_usage(
+    state: &AppState,
+    session_id: &str,
+    bytes_sent: i64,
+    bytes_received: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sessions
+        SET bytes_sent = bytes_sent + $2,
+            bytes_received = bytes_received + $3
+        WHERE id = $1
+        "#,
+    )
+    .bind(uuid::Uuid::parse_str(session_id)?)
+    .bind(bytes_sent)
+    .bind(bytes_received)
+    .execute(state.db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn mark_session_ended(state: &AppState, session_id: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sessions
+        SET status = 'ended', ended_at = COALESCE(ended_at, NOW())
+        WHERE id = $1 AND status <> 'ended'
+        "#,
+    )
+    .bind(uuid::Uuid::parse_str(session_id)?)
+    .execute(state.db.pool())
+    .await?;
+    Ok(())
+}
+
+async fn end_machine_sessions(state: &AppState, machine_id: uuid::Uuid) -> anyhow::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE sessions
+        SET status = 'ended', ended_at = COALESCE(ended_at, NOW())
+        WHERE machine_id = $1 AND status <> 'ended'
+        "#,
+    )
+    .bind(machine_id)
+    .execute(state.db.pool())
+    .await?;
+    Ok(())
 }

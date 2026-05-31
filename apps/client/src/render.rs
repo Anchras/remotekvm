@@ -4,13 +4,175 @@
 //! pixels back. This exercises the exact tessellate → upload-buffers → render
 //! path used by the live event loop (the path whose `RedrawRequested` arm was
 //! previously unreachable), without needing a window or Screen Recording
-//! permission. Test-only.
+//! permission in tests. Runtime helpers in this module convert decoded video
+//! frames into egui textures so egui-wgpu uploads them through the live render
+//! path.
 
-#![cfg(test)]
+use anyhow::{anyhow, Result};
 
+use crate::media::{DecodedVideoFrame, VideoPixelFormat};
+
+#[derive(Default)]
+pub struct VideoTexture {
+    texture: Option<egui::TextureHandle>,
+}
+
+impl VideoTexture {
+    pub fn show_frame(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &DecodedVideoFrame,
+    ) -> Result<egui::Response> {
+        let image = decoded_frame_to_color_image(frame)?;
+        let options = egui::TextureOptions::LINEAR;
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, options);
+        } else {
+            self.texture = Some(ui.ctx().load_texture("remote-video", image, options));
+        }
+
+        let texture = self
+            .texture
+            .as_ref()
+            .ok_or_else(|| anyhow!("video texture was not created"))?;
+        let size = fitted_video_size(
+            egui::vec2(frame.width as f32, frame.height as f32),
+            ui.available_size(),
+        );
+        Ok(ui.add(egui::Image::new(texture).fit_to_exact_size(size)))
+    }
+}
+
+fn fitted_video_size(video: egui::Vec2, available: egui::Vec2) -> egui::Vec2 {
+    if video.x <= 0.0 || video.y <= 0.0 {
+        return egui::vec2(1.0, 1.0);
+    }
+    let max_width = available.x.max(1.0);
+    let max_height = available.y.max(1.0);
+    let scale = (max_width / video.x).min(max_height / video.y).min(1.0);
+    egui::vec2((video.x * scale).max(1.0), (video.y * scale).max(1.0))
+}
+
+fn decoded_frame_to_color_image(frame: &DecodedVideoFrame) -> Result<egui::ColorImage> {
+    let rgba = decoded_frame_to_rgba(frame)?;
+    Ok(egui::ColorImage::from_rgba_unmultiplied(
+        [frame.width as usize, frame.height as usize],
+        &rgba,
+    ))
+}
+
+fn decoded_frame_to_rgba(frame: &DecodedVideoFrame) -> Result<Vec<u8>> {
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    if width == 0 || height == 0 {
+        anyhow::bail!("decoded video frame has zero dimensions");
+    }
+    let pixels = width
+        .checked_mul(height)
+        .ok_or_else(|| anyhow!("decoded video frame dimensions overflow"))?;
+    match frame.format {
+        VideoPixelFormat::Rgba8 => {
+            let expected = pixels * 4;
+            if frame.data.len() != expected {
+                anyhow::bail!(
+                    "RGBA frame size mismatch: got {}, expected {expected}",
+                    frame.data.len()
+                );
+            }
+            Ok(frame.data.to_vec())
+        }
+        VideoPixelFormat::Bgra8 => {
+            let expected = pixels * 4;
+            if frame.data.len() != expected {
+                anyhow::bail!(
+                    "BGRA frame size mismatch: got {}, expected {expected}",
+                    frame.data.len()
+                );
+            }
+            let mut rgba = Vec::with_capacity(expected);
+            for bgra in frame.data.chunks_exact(4) {
+                rgba.extend_from_slice(&[bgra[2], bgra[1], bgra[0], bgra[3]]);
+            }
+            Ok(rgba)
+        }
+        VideoPixelFormat::Nv12 => nv12_to_rgba(&frame.data, width, height),
+        VideoPixelFormat::I420 => i420_to_rgba(&frame.data, width, height),
+    }
+}
+
+fn nv12_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    let y_len = width * height;
+    let uv_height = (height + 1) / 2;
+    let expected = y_len + width * uv_height;
+    if data.len() < expected {
+        anyhow::bail!(
+            "NV12 frame too small: got {}, expected at least {expected}",
+            data.len()
+        );
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let luma = data[y * width + x];
+            let uv_index = y_len + (y / 2) * width + (x / 2) * 2;
+            let u = data[uv_index];
+            let v = data[uv_index + 1];
+            push_yuv_as_rgba(&mut rgba, luma, u, v);
+        }
+    }
+    Ok(rgba)
+}
+
+fn i420_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
+    let y_len = width * height;
+    let chroma_width = (width + 1) / 2;
+    let chroma_height = (height + 1) / 2;
+    let chroma_len = chroma_width * chroma_height;
+    let u_offset = y_len;
+    let v_offset = u_offset + chroma_len;
+    let expected = v_offset + chroma_len;
+    if data.len() < expected {
+        anyhow::bail!(
+            "I420 frame too small: got {}, expected at least {expected}",
+            data.len()
+        );
+    }
+
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let chroma_index = (y / 2) * chroma_width + (x / 2);
+            push_yuv_as_rgba(
+                &mut rgba,
+                data[y * width + x],
+                data[u_offset + chroma_index],
+                data[v_offset + chroma_index],
+            );
+        }
+    }
+    Ok(rgba)
+}
+
+fn push_yuv_as_rgba(out: &mut Vec<u8>, y: u8, u: u8, v: u8) {
+    let y = y as f32;
+    let u = u as f32 - 128.0;
+    let v = v as f32 - 128.0;
+    let r = y + 1.402 * v;
+    let g = y - 0.344_136 * u - 0.714_136 * v;
+    let b = y + 1.772 * u;
+    out.extend_from_slice(&[clamp_rgb(r), clamp_rgb(g), clamp_rgb(b), 255]);
+}
+
+fn clamp_rgb(value: f32) -> u8 {
+    value.round().clamp(0.0, 255.0) as u8
+}
+
+#[cfg(test)]
 use egui::Context;
 
 /// Render `run_ui` to a `width`×`height` RGBA8 texture; return the raw pixels.
+#[cfg(test)]
 pub fn render_to_rgba(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -123,6 +285,39 @@ pub fn render_to_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+
+    #[test]
+    fn bgra_frame_converts_to_rgba() {
+        let frame = DecodedVideoFrame {
+            width: 1,
+            height: 1,
+            format: VideoPixelFormat::Bgra8,
+            pts: None,
+            data: Bytes::from_static(&[10, 20, 30, 255]),
+        };
+
+        assert_eq!(
+            decoded_frame_to_rgba(&frame).unwrap(),
+            vec![30, 20, 10, 255]
+        );
+    }
+
+    #[test]
+    fn nv12_neutral_chroma_converts_luma_to_gray() {
+        let frame = DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            format: VideoPixelFormat::Nv12,
+            pts: None,
+            data: Bytes::from_static(&[64, 128, 192, 255, 128, 128]),
+        };
+
+        assert_eq!(
+            decoded_frame_to_rgba(&frame).unwrap(),
+            vec![64, 64, 64, 255, 128, 128, 128, 255, 192, 192, 192, 255, 255, 255, 255, 255,]
+        );
+    }
 
     async fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {

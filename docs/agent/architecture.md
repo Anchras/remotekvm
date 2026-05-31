@@ -202,7 +202,7 @@ On macOS, we use a single-process architecture running as a `launchd` background
 │        remotekvm-agent (launchd)            │
 │                                             │
 │  - ScreenCaptureKit capture                 │
-│  - VideoToolbox HEVC encode                 │
+│  - VideoToolbox H.264 encode                │
 │  - Core Audio capture                       │
 │  - WebRTC peer connection                   │
 │  - CGEventPost injection                    │
@@ -210,7 +210,26 @@ On macOS, we use a single-process architecture running as a `launchd` background
 └─────────────────────────────────────────────┘
 ```
 
-**Existing code in `apps/host/src/macos/`** can be largely reused, refactored into the agent crate.
+The current agent crate owns the macOS capture path in `apps/agent/src/macos/`.
+With the `macos_v0` feature enabled, each SaaS connection session attempts to
+start:
+
+```
+ScreenCaptureKit SCStream
+  -> CVPixelBuffer
+    -> VideoToolbox VTCompressionSession (H.264 constrained baseline)
+      -> Annex-B encoded frames
+        -> WebRTC H.264 video track
+```
+
+The pipeline is wired into the active `PeerSession` before answering the client
+offer. It advertises a browser-compatible H.264 WebRTC video track and writes
+VideoToolbox samples through `webrtc-rs`' H.264 payloader. If ScreenCaptureKit,
+VideoToolbox, or track setup fails, the agent continues control-only unless
+`--require-video` is set.
+
+See [macOS launchd Agent](macos-launchd.md) for the LaunchAgent template and
+Screen Recording / Accessibility permission workflow.
 
 ---
 

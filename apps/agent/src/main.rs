@@ -5,9 +5,11 @@
 // carries input events (client → host), which are injected into the OS.
 //
 // Platform support:
-//   - macOS: signaling + control channel + input injection work today; the
-//     ScreenCaptureKit/VideoToolbox capture→video-track wiring is the next step.
-//   - Windows: capture/encode/audio/service are Phase 1 (still stubbed).
+//   - macOS: signaling + control channel + input injection work today; with
+//     `--features macos_v0`, ScreenCaptureKit/VideoToolbox publishes H.264
+//     samples to an advertised WebRTC video track.
+//   - Windows: service/controller scaffolding, WASAPI audio, and H.264 video
+//     pipeline boundaries are in place.
 
 use anyhow::Result;
 use clap::Parser;
@@ -50,6 +52,9 @@ struct Args {
     /// Target bitrate, kbps.
     #[arg(long, default_value_t = 20_000)]
     bitrate_kbps: u32,
+    /// Fail a session when the platform video pipeline cannot start.
+    #[arg(long, env = "RKVM_REQUIRE_VIDEO", default_value_t = false)]
+    require_video: bool,
 }
 
 #[tokio::main]
@@ -66,7 +71,14 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if args.service {
-            return windows::service::run_service().await;
+            let token = args.token.clone().ok_or_else(|| {
+                anyhow::anyhow!("Registration token required (--token or RKVM_REGISTRATION_TOKEN)")
+            })?;
+            return windows::service::run_service(windows::service::ServiceConfig::new(
+                args.server_url.clone(),
+                token,
+            ))
+            .await;
         }
     }
 
@@ -109,9 +121,10 @@ async fn run_standalone(args: Args) -> Result<()> {
 
         tracing::info!(session_id = %request.session_id, "connection request received");
         let server = Arc::clone(&server);
+        let args = args.clone();
         tokio::spawn(async move {
             let session_id = request.session_id.clone();
-            if let Err(e) = run_session(server, request).await {
+            if let Err(e) = run_session(server, request, args).await {
                 tracing::error!(error = %e, %session_id, "session failed");
             }
         });
@@ -125,10 +138,22 @@ async fn run_standalone(args: Args) -> Result<()> {
 async fn run_session(
     server: Arc<server_client::ServerClient>,
     request: signaling::ConnectionRequest,
+    args: Args,
 ) -> Result<()> {
     tracing::info!(session_id = %request.session_id, "starting session");
 
     let session = PeerSession::answerer().await?;
+    let control_state = signaling::AgentControlState::new(args.bitrate_kbps);
+    let host_video = signaling::HostVideoConfig {
+        display_width: args.width,
+        display_height: args.height,
+        refresh_hz: args.fps,
+        bitrate_kbps: args.bitrate_kbps,
+    };
+    let video_pipeline = start_platform_video(&session, &args).await?;
+    #[cfg(not(any(target_os = "windows", all(target_os = "macos", feature = "macos_v0"))))]
+    let _ = &video_pipeline;
+    let audio_pipeline = start_platform_audio(&session, &args).await?;
     session.accept_offer(&request.offer).await?;
 
     // Non-trickle: the answer embeds our ICE candidates, matching the offer the
@@ -136,21 +161,118 @@ async fn run_session(
     let answer = session.wait_ice_gathering().await?;
     server.send_answer(&request.session_id, &answer)?;
 
-    // TODO (Phase 1/3): create a video track from the platform capture+encode
-    // pipeline (DXGI/NVENC on Windows, ScreenCaptureKit/VideoToolbox on macOS)
-    // and add it to `session.peer_connection()` before answering.
-
     let injector = input::InputInjector::new();
+
     while let Some(msg) = session.recv().await {
         match msg {
             ChannelMessage::Input(event) => injector.inject(&event),
             ChannelMessage::Control(ctrl) => {
-                tracing::debug!(?ctrl, "control message received")
+                signaling::handle_agent_control(&session, &control_state, &host_video, ctrl)
+                    .await?;
+                #[cfg(target_os = "windows")]
+                if let Some(video_pipeline) = &video_pipeline {
+                    if let Err(error) = video_pipeline.apply_control_state(&control_state) {
+                        tracing::warn!(%error, "failed to apply video control state");
+                    }
+                }
             }
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "macos_v0"))]
+    if let Some(video_pipeline) = video_pipeline {
+        if let Err(e) = video_pipeline.stop().await {
+            tracing::warn!(error = %e, "failed to stop macOS video pipeline cleanly");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(video_pipeline) = video_pipeline {
+        video_pipeline.stop().await;
+    }
+
+    #[cfg(target_os = "windows")]
+    if let Some(audio_pipeline) = audio_pipeline {
+        audio_pipeline.stop().await;
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = audio_pipeline;
+
     session.close().await?;
     tracing::info!(session_id = %request.session_id, "session ended");
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", feature = "macos_v0"))]
+async fn start_platform_video(
+    session: &PeerSession,
+    args: &Args,
+) -> Result<Option<macos::VideoPipeline>> {
+    let config = macos::VideoConfig {
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        bitrate_kbps: args.bitrate_kbps,
+    };
+
+    match macos::VideoPipeline::start(session.peer_connection().clone(), config).await {
+        Ok(pipeline) => Ok(Some(pipeline)),
+        Err(e) if args.require_video => Err(e),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "macOS video pipeline unavailable; continuing control-only"
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn start_platform_video(
+    session: &PeerSession,
+    args: &Args,
+) -> Result<Option<windows::VideoPipeline>> {
+    let config = windows::VideoConfig {
+        width: args.width,
+        height: args.height,
+        fps: args.fps,
+        bitrate_kbps: args.bitrate_kbps,
+    };
+
+    match windows::VideoPipeline::start(session.peer_connection().clone(), config).await {
+        Ok(pipeline) => Ok(pipeline),
+        Err(e) if args.require_video => Err(e),
+        Err(error) => {
+            tracing::warn!(%error, "Windows video pipeline unavailable; continuing without video");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "windows", all(target_os = "macos", feature = "macos_v0"))))]
+async fn start_platform_video(_session: &PeerSession, args: &Args) -> Result<Option<()>> {
+    if args.require_video {
+        anyhow::bail!("video pipeline is not available in this build");
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "windows")]
+async fn start_platform_audio(
+    session: &PeerSession,
+    _args: &Args,
+) -> Result<Option<windows::audio::AudioPipeline>> {
+    match windows::audio::AudioPipeline::start(session.peer_connection().clone(), 64).await {
+        Ok(pipeline) => Ok(pipeline),
+        Err(error) => {
+            tracing::warn!(%error, "Windows audio pipeline unavailable; continuing without audio");
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn start_platform_audio(_session: &PeerSession, _args: &Args) -> Result<Option<()>> {
+    Ok(None)
 }

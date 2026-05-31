@@ -403,6 +403,17 @@ Authorization: Bearer <jwt_token>
 }
 ```
 
+### Signaling State
+
+Agent and client WebSocket sender channels are process-local. In production,
+set `REDIS_URL` to persist ephemeral presence and routing metadata with TTLs:
+`remotekvm:signaling:agent:{machine_id}` and
+`remotekvm:signaling:session:{session_id}`. This lets operators see which
+server instance owns an agent/session and supports load-balancer affinity, but
+it does not move WebSocket delivery through Redis. Until a cross-instance
+relay/pub-sub layer exists, `/client` traffic for a session must reach the same
+server instance as the agent WebSocket.
+
 ---
 
 ## Error Responses

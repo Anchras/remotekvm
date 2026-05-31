@@ -20,11 +20,13 @@ use winit::{
 mod app;
 mod auth;
 mod config;
+mod media;
 mod render;
 mod server_client;
 mod signaling;
 
 use app::App;
+use auth::deep_link_args;
 use config::Config;
 
 #[tokio::main]
@@ -110,8 +112,12 @@ async fn main() -> Result<()> {
         app_config.server_url.clone(),
         app_config.api_url.clone(),
         app_config.ws_url.clone(),
+        app_config.use_deep_link_auth,
         rt_handle,
     );
+    for url in deep_link_args(std::env::args().skip(1)) {
+        app.handle_deep_link_url(&url);
+    }
 
     // Event loop
     event_loop.run(move |event, window_target| {

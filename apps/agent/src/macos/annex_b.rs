@@ -1,12 +1,14 @@
-// Convert VideoToolbox-emitted CMSampleBuffers (AVCC, length-prefixed) into annex-B
-// (start-code-prefixed) NAL units suitable for HEVC files and RTP packetization.
+// Convert VideoToolbox-emitted CMSampleBuffers (AVCC, length-prefixed) into Annex B
+// (start-code-prefixed) H.264 NAL units suitable for webrtc-rs' H.264 payloader.
 //
-// On keyframes the VPS/SPS/PPS parameter sets must be prepended; they live in the
+// On keyframes the SPS/PPS parameter sets must be prepended; they live in the
 // CMVideoFormatDescription, not the block buffer.
 
 use anyhow::{anyhow, Result};
-use objc2::rc::Retained;
-use objc2_core_media::{CMBlockBuffer, CMFormatDescription, CMSampleBuffer};
+use objc2_core_media::{
+    CMBlockBuffer, CMFormatDescription, CMSampleBuffer,
+    CMVideoFormatDescriptionGetH264ParameterSetAtIndex,
+};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
@@ -18,7 +20,7 @@ pub fn sample_to_annex_b(sample: &CMSampleBuffer, is_keyframe: bool) -> Result<V
     if is_keyframe {
         let fmt = unsafe { sample.format_description() }
             .ok_or_else(|| anyhow!("sample has no format description"))?;
-        append_hevc_parameter_sets(&fmt, &mut out)?;
+        append_h264_parameter_sets(&fmt, &mut out)?;
     }
 
     let block =
@@ -28,12 +30,12 @@ pub fn sample_to_annex_b(sample: &CMSampleBuffer, is_keyframe: bool) -> Result<V
     Ok(out)
 }
 
-fn append_hevc_parameter_sets(fmt: &CMFormatDescription, out: &mut Vec<u8>) -> Result<()> {
+fn append_h264_parameter_sets(fmt: &CMFormatDescription, out: &mut Vec<u8>) -> Result<()> {
     let mut count: usize = 0;
     let mut nal_header_len: i32 = 0;
     // First call: ask for the parameter set count and NAL header length (should be 4 for AVCC).
     let status = unsafe {
-        CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+        CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
             fmt,
             0,
             std::ptr::null_mut(),
@@ -43,13 +45,13 @@ fn append_hevc_parameter_sets(fmt: &CMFormatDescription, out: &mut Vec<u8>) -> R
         )
     };
     if status != 0 {
-        return Err(anyhow!("GetHEVCParameterSetAtIndex(count) status={status}"));
+        return Err(anyhow!("GetH264ParameterSetAtIndex(count) status={status}"));
     }
     for i in 0..count {
         let mut data_ptr: *const u8 = std::ptr::null();
         let mut size: usize = 0;
         let status = unsafe {
-            CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+            CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 fmt,
                 i,
                 &mut data_ptr,
@@ -59,7 +61,7 @@ fn append_hevc_parameter_sets(fmt: &CMFormatDescription, out: &mut Vec<u8>) -> R
             )
         };
         if status != 0 || data_ptr.is_null() {
-            return Err(anyhow!("GetHEVCParameterSetAtIndex({i}) status={status}"));
+            return Err(anyhow!("GetH264ParameterSetAtIndex({i}) status={status}"));
         }
         out.extend_from_slice(&ANNEX_B_START_CODE);
         out.extend_from_slice(unsafe { std::slice::from_raw_parts(data_ptr, size) });
@@ -96,16 +98,4 @@ fn append_avcc_as_annex_b(block: &CMBlockBuffer, out: &mut Vec<u8>) -> Result<()
         pos += nal_len;
     }
     Ok(())
-}
-
-extern "C-unwind" {
-    // Not yet exposed in objc2-core-media's safe surface (as of 0.3), so bind directly.
-    fn CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-        videoDesc: &CMFormatDescription,
-        parameterSetIndex: usize,
-        parameterSetPointerOut: *mut *const u8,
-        parameterSetSizeOut: *mut usize,
-        parameterSetCountOut: *mut usize,
-        NALUnitHeaderLengthOut: *mut i32,
-    ) -> i32;
 }

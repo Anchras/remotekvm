@@ -21,6 +21,12 @@ pub struct Config {
     pub public_base_url: String,
     pub jwt_secret: String,
     pub jwt_expiry_hours: i64,
+    /// Optional Redis URL used for cross-instance ephemeral signaling metadata.
+    /// WebSocket senders remain process-local; Redis stores presence and routing
+    /// hints with TTLs for deployments that need instance affinity.
+    pub redis_url: Option<String>,
+    pub signaling_instance_id: String,
+    pub signaling_ttl_seconds: u64,
     // --- Stripe billing (optional; endpoints 400 if the key is unset) ---
     pub stripe_secret_key: String,
     pub stripe_webhook_secret: String,
@@ -65,6 +71,24 @@ impl Config {
         let public_base_url =
             std::env::var("PUBLIC_BASE_URL").unwrap_or_else(|_| format!("http://localhost:{port}"));
 
+        let redis_url = std::env::var("REDIS_URL")
+            .ok()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+
+        let signaling_instance_id = std::env::var("SIGNALING_INSTANCE_ID")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| format!("server-{}", uuid::Uuid::new_v4()));
+
+        let signaling_ttl_seconds = std::env::var("SIGNALING_TTL_SECONDS")
+            .unwrap_or_else(|_| "90".to_string())
+            .parse()?;
+        if signaling_ttl_seconds == 0 {
+            anyhow::bail!("SIGNALING_TTL_SECONDS must be greater than 0");
+        }
+
         // Stripe is optional: billing endpoints return an error if unconfigured.
         let stripe_secret_key = std::env::var("STRIPE_SECRET_KEY").unwrap_or_default();
         let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
@@ -81,6 +105,9 @@ impl Config {
             public_base_url,
             jwt_secret,
             jwt_expiry_hours,
+            redis_url,
+            signaling_instance_id,
+            signaling_ttl_seconds,
             stripe_secret_key,
             stripe_webhook_secret,
             stripe_price_id,

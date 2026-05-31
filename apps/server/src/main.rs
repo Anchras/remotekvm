@@ -8,6 +8,7 @@ use remotekvm_server::config::Config;
 use remotekvm_server::create_app;
 use remotekvm_server::db::Database;
 use remotekvm_server::state::AppState;
+use remotekvm_server::util::RateLimiter;
 use remotekvm_server::websocket::SignalingState;
 
 #[tokio::main]
@@ -37,13 +38,14 @@ async fn main() -> Result<()> {
     );
     info!("workos client initialized");
 
-    let signaling = SignalingState::new();
+    let signaling = SignalingState::from_config(&config).await?;
 
     let state = Arc::new(AppState {
         db,
         workos,
         config,
         signaling,
+        auth_rate_limiter: RateLimiter::auth_defaults(),
     });
 
     let app = create_app(Arc::clone(&state));
