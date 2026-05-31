@@ -183,6 +183,19 @@ async fn health_ok(pool: PgPool) {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["status"], "ok");
     assert!(body["version"].is_string());
+    assert_eq!(body["dependencies"]["database"], "ok");
+}
+
+#[sqlx::test]
+async fn health_reports_unavailable_when_db_is_down(pool: PgPool) {
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+    pool.close().await;
+
+    let resp = srv.http.get(srv.url("/health")).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "degraded");
+    assert_eq!(body["dependencies"]["database"], "unavailable");
 }
 
 #[sqlx::test]
