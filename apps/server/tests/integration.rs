@@ -26,6 +26,7 @@ use remotekvm_server::config::Config;
 use remotekvm_server::create_app;
 use remotekvm_server::db::Database;
 use remotekvm_server::state::AppState;
+use remotekvm_server::util::RateLimiter;
 use remotekvm_server::websocket::{SignalingMessage, SignalingState};
 
 use remotekvm_protocol::{ChannelMessage, InputEvent};
@@ -62,6 +63,9 @@ fn build_state(pool: PgPool, workos_api_base: String) -> Arc<AppState> {
         public_base_url: "http://localhost:0".to_string(),
         jwt_secret: JWT_SECRET.to_string(),
         jwt_expiry_hours: 24,
+        redis_url: None,
+        signaling_instance_id: "test-instance".to_string(),
+        signaling_ttl_seconds: 90,
         stripe_secret_key: String::new(),
         stripe_webhook_secret: "whsec_test".to_string(),
         stripe_price_id: String::new(),
@@ -77,6 +81,7 @@ fn build_state(pool: PgPool, workos_api_base: String) -> Arc<AppState> {
         workos,
         config,
         signaling: SignalingState::new(),
+        auth_rate_limiter: RateLimiter::auth_defaults(),
     })
 }
 
@@ -115,6 +120,40 @@ async fn spawn_mock_workos() -> String {
     }
 
     let app = Router::new().route("/user_management/authenticate", post(authenticate));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn spawn_mock_workos_user(
+    workos_user_id: &'static str,
+    email: &'static str,
+    first_name: &'static str,
+) -> String {
+    async fn authenticate(
+        axum::extract::State((workos_user_id, email, first_name)): axum::extract::State<(
+            &'static str,
+            &'static str,
+            &'static str,
+        )>,
+    ) -> Json<Value> {
+        Json(json!({
+            "user": {
+                "id": workos_user_id,
+                "email": email,
+                "firstName": first_name,
+                "lastName": "Member",
+                "organizations": []
+            }
+        }))
+    }
+
+    let app = Router::new()
+        .route("/user_management/authenticate", post(authenticate))
+        .with_state((workos_user_id, email, first_name));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -177,7 +216,7 @@ async fn next_signaling(
 
 #[sqlx::test]
 async fn health_ok(pool: PgPool) {
-    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
     let resp = srv.http.get(srv.url("/health")).send().await.unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -187,7 +226,7 @@ async fn health_ok(pool: PgPool) {
 
 #[sqlx::test]
 async fn protected_routes_require_jwt(pool: PgPool) {
-    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
 
     // No Authorization header.
     for path in ["/api/me", "/api/machines"] {
@@ -303,7 +342,7 @@ async fn workos_callback_issues_jwt_and_syncs_user(pool: PgPool) {
 async fn machine_crud_lifecycle(pool: PgPool) {
     let user = insert_user(&pool, "workos_owner", "owner@example.com").await;
     let jwt = jwt_for(user, "owner@example.com");
-    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
 
     // Register.
     let (machine_id, token1) = register_machine(&srv, &jwt, "Workstation").await;
@@ -413,6 +452,420 @@ async fn machines_are_isolated_between_users(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn organization_endpoints_enforce_admin_and_share_machines(pool: PgPool) {
+    let admin = insert_user(&pool, "workos_admin", "admin@example.com").await;
+    let member = insert_user(&pool, "workos_member", "member@example.com").await;
+    let admin_jwt = jwt_for(admin, "admin@example.com");
+    let member_jwt = jwt_for(member, "member@example.com");
+
+    let org_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO organizations (workos_org_id, name, slug) VALUES ('org_acme', 'Acme Corp', 'acme-corp') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'member')",
+    )
+    .bind(org_id)
+    .bind(admin)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+    let (machine_id, _) = register_machine(&srv, &admin_jwt, "Admin-Box").await;
+
+    let orgs: Value = srv
+        .http
+        .get(srv.url("/api/organizations"))
+        .bearer_auth(&admin_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(orgs["organizations"][0]["slug"], "acme-corp");
+    assert_eq!(orgs["organizations"][0]["role"], "admin");
+
+    let resp = srv
+        .http
+        .get(srv.url(&format!("/api/organizations/{org_id}/members")))
+        .bearer_auth(&member_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "plain members cannot list members");
+
+    let members: Value = srv
+        .http
+        .get(srv.url(&format!("/api/organizations/{org_id}/members")))
+        .bearer_auth(&admin_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["members"].as_array().unwrap().len(), 2);
+    assert_eq!(members["pending_invites"].as_array().unwrap().len(), 0);
+
+    let invited: Value = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&admin_jwt)
+        .json(&json!({ "email": "new@example.com", "role": "member" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(invited["status"], "invited");
+
+    let shared: Value = srv
+        .http
+        .put(srv.url(&format!(
+            "/api/organizations/{org_id}/machines/{machine_id}"
+        )))
+        .bearer_auth(&admin_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shared["status"], "shared");
+    let org_machine: Option<Uuid> =
+        sqlx::query_scalar("SELECT organization_id FROM machines WHERE id = $1")
+            .bind(Uuid::parse_str(&machine_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(org_machine, Some(org_id));
+}
+
+#[sqlx::test]
+async fn organization_creation_invites_and_accepts_pending_membership(pool: PgPool) {
+    let owner = insert_user(&pool, "workos_owner", "owner@example.com").await;
+    let owner_jwt = jwt_for(owner, "owner@example.com");
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+
+    let created: Value = srv
+        .http
+        .post(srv.url("/api/organizations"))
+        .bearer_auth(&owner_jwt)
+        .json(&json!({ "name": "Remote Ops", "slug": "Remote Ops Team!" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let org_id = created["id"].as_str().unwrap();
+    assert_eq!(created["slug"], "remote-ops-team");
+    assert_eq!(created["role"], "owner");
+
+    let owner_role: String = sqlx::query_scalar(
+        "SELECT role FROM organization_members WHERE organization_id = $1 AND user_id = $2",
+    )
+    .bind(Uuid::parse_str(org_id).unwrap())
+    .bind(owner)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owner_role, "owner");
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&owner_jwt)
+        .json(&json!({ "email": "Pending.Member@Example.com", "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let members: Value = srv
+        .http
+        .get(srv.url(&format!("/api/organizations/{org_id}/members")))
+        .bearer_auth(&owner_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["members"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        members["pending_invites"][0]["email"],
+        "pending.member@example.com"
+    );
+
+    let workos = spawn_mock_workos_user(
+        "workos_pending_member",
+        "pending.member@example.com",
+        "Pending",
+    )
+    .await;
+    let invited_srv = spawn(build_state(pool.clone(), workos)).await;
+    let auth: Value = invited_srv
+        .http
+        .get(invited_srv.url("/auth/workos/callback?code=accept_invite"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let invited_jwt = auth["token"].as_str().unwrap();
+
+    let me: Value = invited_srv
+        .http
+        .get(invited_srv.url("/api/me"))
+        .bearer_auth(invited_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["organizations"][0]["id"], org_id);
+    assert_eq!(me["organizations"][0]["role"], "member");
+
+    let members: Value = srv
+        .http
+        .get(srv.url(&format!("/api/organizations/{org_id}/members")))
+        .bearer_auth(&owner_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(members["members"].as_array().unwrap().len(), 2);
+    assert_eq!(members["pending_invites"].as_array().unwrap().len(), 0);
+}
+
+#[sqlx::test]
+async fn organization_rbac_blocks_member_admin_paths(pool: PgPool) {
+    let owner = insert_user(&pool, "workos_owner", "owner@example.com").await;
+    let admin = insert_user(&pool, "workos_admin", "admin@example.com").await;
+    let member = insert_user(&pool, "workos_member", "member@example.com").await;
+    let owner_jwt = jwt_for(owner, "owner@example.com");
+    let admin_jwt = jwt_for(admin, "admin@example.com");
+    let member_jwt = jwt_for(member, "member@example.com");
+
+    let org_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO organizations (workos_org_id, name, slug) VALUES ('org_rbac', 'RBAC Org', 'rbac-org') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'admin'), ($1, $4, 'member')",
+    )
+    .bind(org_id)
+    .bind(owner)
+    .bind(admin)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let (machine_id, _) = register_machine(&srv, &owner_jwt, "Owner-Box").await;
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&admin_jwt)
+        .json(&json!({ "email": "new-owner@example.com", "role": "owner" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "admins cannot grant owner");
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&admin_jwt)
+        .json(&json!({ "email": "owner@example.com", "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "admins cannot demote owners");
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&admin_jwt)
+        .json(&json!({ "email": "new-admin@example.com", "role": "admin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "admins can invite admins");
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/organizations/{org_id}/invite")))
+        .bearer_auth(&member_jwt)
+        .json(&json!({ "email": "new-member@example.com", "role": "member" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "members cannot invite");
+
+    let resp = srv
+        .http
+        .put(srv.url(&format!(
+            "/api/organizations/{org_id}/machines/{machine_id}"
+        )))
+        .bearer_auth(&member_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "members cannot share machines");
+
+    let resp = srv
+        .http
+        .post(srv.url("/api/machines"))
+        .bearer_auth(&member_jwt)
+        .json(&json!({
+            "name": "Bypass-Box",
+            "hostname": "bypass-host",
+            "platform": "macos",
+            "organization_id": org_id
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "members cannot attach machines directly to an org"
+    );
+}
+
+#[sqlx::test]
+async fn shared_machines_are_visible_and_connectable_to_members_only(pool: PgPool) {
+    let owner = insert_user(&pool, "workos_owner", "owner@example.com").await;
+    let member = insert_user(&pool, "workos_member", "member@example.com").await;
+    let outsider = insert_user(&pool, "workos_outsider", "outsider@example.com").await;
+    let owner_jwt = jwt_for(owner, "owner@example.com");
+    let member_jwt = jwt_for(member, "member@example.com");
+    let outsider_jwt = jwt_for(outsider, "outsider@example.com");
+
+    let org_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO organizations (workos_org_id, name, slug) VALUES ('org_share', 'Share Org', 'share-org') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'owner'), ($1, $3, 'member')",
+    )
+    .bind(org_id)
+    .bind(owner)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let (machine_id, reg_token) = register_machine(&srv, &owner_jwt, "Shared-Box").await;
+
+    let resp = srv
+        .http
+        .put(srv.url(&format!(
+            "/api/organizations/{org_id}/machines/{machine_id}"
+        )))
+        .bearer_auth(&owner_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let member_list: Value = srv
+        .http
+        .get(srv.url("/api/machines"))
+        .bearer_auth(&member_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(member_list["machines"].as_array().unwrap().len(), 1);
+    assert_eq!(member_list["machines"][0]["id"], machine_id);
+
+    let resp = srv
+        .http
+        .get(srv.url(&format!("/api/machines/{machine_id}")))
+        .bearer_auth(&member_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "members can fetch shared machines");
+
+    let outsider_list: Value = srv
+        .http
+        .get(srv.url("/api/machines"))
+        .bearer_auth(&outsider_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(outsider_list["machines"].as_array().unwrap().len(), 0);
+
+    let resp = srv
+        .http
+        .get(srv.url(&format!("/api/machines/{machine_id}")))
+        .bearer_auth(&outsider_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "outsiders cannot fetch shared machines");
+
+    let (agent_ws, _) =
+        tokio_tungstenite::connect_async(srv.ws_url(&format!("/agent?token={reg_token}")))
+            .await
+            .expect("agent websocket connect");
+
+    let mut connected = false;
+    for _ in 0..50 {
+        let resp = srv
+            .http
+            .post(srv.url(&format!("/api/machines/{machine_id}/connect")))
+            .bearer_auth(&member_jwt)
+            .send()
+            .await
+            .unwrap();
+        if resp.status() == 200 {
+            connected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(connected, "members can connect to shared machines");
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/machines/{machine_id}/connect")))
+        .bearer_auth(&outsider_jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404, "outsiders cannot connect");
+
+    drop(agent_ws);
+}
+
+#[sqlx::test]
 async fn connect_rejects_when_no_agent_connected(pool: PgPool) {
     let user = insert_user(&pool, "workos_owner", "owner@example.com").await;
     let jwt = jwt_for(user, "owner@example.com");
@@ -457,7 +910,7 @@ async fn connect_rejects_when_no_agent_connected(pool: PgPool) {
 async fn signaling_relay_end_to_end(pool: PgPool) {
     let user = insert_user(&pool, "workos_owner", "owner@example.com").await;
     let jwt = jwt_for(user, "owner@example.com");
-    let srv = spawn(build_state(pool, "http://unused".into())).await;
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
 
     let (_machine_id, reg_token) = register_machine(&srv, &jwt, "Workstation").await;
 
@@ -542,6 +995,12 @@ async fn signaling_relay_end_to_end(pool: PgPool) {
         }
         other => panic!("client expected ConnectResponse, got {other:?}"),
     }
+    let status: String = sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
+        .bind(Uuid::parse_str(&session_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "active");
 
     // 7. ICE candidate from agent is relayed to the client.
     let ice = SignalingMessage::IceCandidate {
@@ -559,6 +1018,21 @@ async fn signaling_relay_end_to_end(pool: PgPool) {
         }
         other => panic!("client expected IceCandidate, got {other:?}"),
     }
+
+    drop(client_ws);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let list: Value = srv
+        .http
+        .get(srv.url("/api/sessions"))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"][0]["id"], session_id);
+    assert_eq!(list["sessions"][0]["status"], "ended");
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +1087,30 @@ async fn login_init_redirects_to_workos_authorize(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), 400);
+}
+
+#[sqlx::test]
+async fn auth_routes_are_rate_limited(pool: PgPool) {
+    let srv = spawn(build_state(pool, "https://workos.test".into())).await;
+    let client = no_redirect_client();
+
+    for _ in 0..30 {
+        let resp = client
+            .get(srv.url("/auth/login?redirect_uri=https://evil.example.com/steal"))
+            .header("x-forwarded-for", "203.0.113.10")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    let resp = client
+        .get(srv.url("/auth/login?redirect_uri=https://evil.example.com/steal"))
+        .header("x-forwarded-for", "203.0.113.10")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 429);
 }
 
 #[sqlx::test]
@@ -843,6 +1341,7 @@ fn build_state_with_stripe(pool: PgPool, stripe_base: String) -> Arc<AppState> {
         workos: state.workos.clone(),
         config,
         signaling: SignalingState::new(),
+        auth_rate_limiter: RateLimiter::auth_defaults(),
     })
 }
 
@@ -885,6 +1384,112 @@ async fn billing_checkout_returns_stripe_url(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status(), 401);
+}
+
+#[sqlx::test]
+async fn billing_checkout_supports_org_seat_quantity_and_usage(pool: PgPool) {
+    let stripe = spawn_mock_stripe().await;
+    let admin = insert_user(&pool, "workos_admin", "admin@example.com").await;
+    let member = insert_user(&pool, "workos_member", "member@example.com").await;
+    let admin_jwt = jwt_for(admin, "admin@example.com");
+    let org_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO organizations (workos_org_id, name, slug) VALUES ('org_billing', 'Billing Org', 'billing-org') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO organization_members (organization_id, user_id, role) VALUES ($1, $2, 'admin'), ($1, $3, 'member')",
+    )
+    .bind(org_id)
+    .bind(admin)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let srv = spawn(build_state_with_stripe(pool.clone(), stripe)).await;
+    let resp = srv
+        .http
+        .post(srv.url("/api/billing/checkout"))
+        .bearer_auth(&admin_jwt)
+        .json(&json!({ "organization_id": org_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let seat_count: i32 = sqlx::query_scalar("SELECT seat_count FROM organizations WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(seat_count, 2);
+
+    let (machine_id, _) = register_machine(&srv, &admin_jwt, "Billing-Box").await;
+    let machine_id = Uuid::parse_str(&machine_id).unwrap();
+    sqlx::query("UPDATE machines SET organization_id = $1 WHERE id = $2")
+        .bind(org_id)
+        .bind(machine_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO sessions (user_id, machine_id, started_at, ended_at, status, bytes_sent, bytes_received)
+        VALUES ($1, $2, NOW() - INTERVAL '15 minutes', NOW(), 'ended', 1024, 2048)
+        "#,
+    )
+    .bind(admin)
+    .bind(machine_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let usage: Value = srv
+        .http
+        .get(srv.url("/api/billing/usage"))
+        .bearer_auth(&admin_jwt)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["organizations"][0]["id"], org_id.to_string());
+    assert_eq!(usage["organizations"][0]["connection_minutes"], 15);
+    assert_eq!(usage["organizations"][0]["bytes_sent"], 1024);
+    assert_eq!(usage["organizations"][0]["bytes_received"], 2048);
+}
+
+#[sqlx::test]
+async fn free_plan_usage_quota_blocks_new_sessions(pool: PgPool) {
+    let user = insert_user(&pool, "workos_owner", "owner@example.com").await;
+    let jwt = jwt_for(user, "owner@example.com");
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+    let (machine_id, _) = register_machine(&srv, &jwt, "Quota-Box").await;
+    let machine_id = Uuid::parse_str(&machine_id).unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO sessions (user_id, machine_id, started_at, ended_at, status)
+        VALUES ($1, $2, NOW() - INTERVAL '121 minutes', NOW(), 'ended')
+        "#,
+    )
+    .bind(user)
+    .bind(machine_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let resp = srv
+        .http
+        .post(srv.url(&format!("/api/machines/{machine_id}/connect")))
+        .bearer_auth(&jwt)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403, "free monthly quota should be enforced");
 }
 
 #[sqlx::test]

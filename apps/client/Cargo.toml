@@ -19,6 +19,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 webrtc = { workspace = true }
 bytes = { workspace = true }
+rtp = "0.11"
+cpal = "0.15"
+libloading = "0.8"
 
 # Windowing & Rendering
 winit = "0.29"
@@ -48,6 +51,36 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSURL"] }
+objc2-core-foundation = { version = "0.3", features = [
+    "CFBase",
+    "CFDictionary",
+    "CFNumber",
+] }
+objc2-core-media = { version = "0.3", features = [
+    "CMBase",
+    "CMTime",
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+objc2-core-video = { version = "0.3", features = [
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }
+objc2-video-toolbox = { version = "0.3", features = [
+    "VTDecompressionSession",
+    "VTErrors",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+] }
 
 [dev-dependencies]
 axum = { workspace = true }

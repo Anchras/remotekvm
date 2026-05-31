@@ -1,26 +1,27 @@
-// VideoToolbox HEVC hardware encoder, tuned for low-latency screen capture.
+// VideoToolbox H.264 hardware encoder, tuned for low-latency screen capture.
 //
 // Properties set:
 //   - RealTime = true
 //   - AllowFrameReordering = false   (no B-frames => 1-frame encoder delay)
 //   - MaxKeyFrameInterval = very large; we drive keyframes explicitly via control msgs
 //   - AverageBitRate = configurable
-//   - ProfileLevel = HEVC_Main_AutoLevel  (Main10 / 4:4:4 are later optimizations)
+//   - ProfileLevel = H264_ConstrainedBaseline_AutoLevel for browser-compatible WebRTC
 //
 // Output callback runs on a VT-owned thread. We push EncodedFrames into a tokio
 // unbounded channel; consumer reads them on whatever runtime task it lives in.
 
 use anyhow::{anyhow, Result};
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString};
-use objc2_core_media::{CMSampleBuffer, CMTime, CMVideoCodecType};
+use objc2_core_foundation::{CFBoolean, CFNumber, CFString, CFType};
+use objc2_core_media::{kCMVideoCodecType_H264, CMSampleBuffer, CMTime};
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality,
     kVTCompressionPropertyKey_ProfileLevel, kVTCompressionPropertyKey_RealTime,
-    kVTProfileLevel_HEVC_Main_AutoLevel, VTCompressionSession, VTEncodeInfoFlags,
+    kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel, VTCompressionSession, VTEncodeInfoFlags,
+    VTSessionSetProperty,
 };
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -28,8 +29,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::annex_b::sample_to_annex_b;
-
-const CM_VIDEO_CODEC_HEVC: CMVideoCodecType = 0x68766331; // 'hvc1'
 
 #[derive(Debug, Clone)]
 pub struct EncoderConfig {
@@ -75,7 +74,7 @@ impl Encoder {
                 None,
                 config.width as i32,
                 config.height as i32,
-                CM_VIDEO_CODEC_HEVC,
+                kCMVideoCodecType_H264,
                 None,
                 None,
                 None,
@@ -108,12 +107,12 @@ impl Encoder {
     }
 
     pub fn encode(&self, image: &CVImageBuffer, pts: CMTime) -> Result<()> {
-        let mut info: VTEncodeInfoFlags = 0;
+        let mut info = VTEncodeInfoFlags(0);
         let status = unsafe {
             self.session.encode_frame(
                 image,
                 pts,
-                CMTime::INVALID,
+                invalid_time(),
                 None,
                 std::ptr::null_mut(),
                 &mut info,
@@ -125,6 +124,7 @@ impl Encoder {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn request_keyframe(&self) {
         // No-op in v0; we'll wire ControlMessage::RequestKeyframe in later by setting
         // kVTEncodeFrameOptionKey_ForceKeyFrame per-frame.
@@ -165,18 +165,14 @@ fn configure_session(session: &VTCompressionSession, cfg: &EncoderConfig) -> Res
     set_cfstring(
         session,
         unsafe { kVTCompressionPropertyKey_ProfileLevel },
-        unsafe { kVTProfileLevel_HEVC_Main_AutoLevel },
+        unsafe { kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel },
     )?;
     Ok(())
 }
 
 fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Result<()> {
-    let v = if value {
-        CFBoolean::true_()
-    } else {
-        CFBoolean::false_()
-    };
-    let status = unsafe { session.set_property(key, Some(v.as_ref().as_opaque())) };
+    let v = CFBoolean::new(value);
+    let status = set_property(session, key, v);
     if status != 0 {
         return Err(anyhow!("VTSessionSetProperty(bool) failed: {status}"));
     }
@@ -185,7 +181,8 @@ fn set_bool(session: &VTCompressionSession, key: &CFString, value: bool) -> Resu
 
 fn set_i32(session: &VTCompressionSession, key: &CFString, value: i32) -> Result<()> {
     let n = CFNumber::new_i32(value);
-    let status = unsafe { session.set_property(key, Some(n.as_ref().as_opaque())) };
+    let n_ref: &CFNumber = n.as_ref();
+    let status = set_property(session, key, n_ref);
     if status != 0 {
         return Err(anyhow!("VTSessionSetProperty(i32) failed: {status}"));
     }
@@ -193,7 +190,7 @@ fn set_i32(session: &VTCompressionSession, key: &CFString, value: i32) -> Result
 }
 
 fn set_cfstring(session: &VTCompressionSession, key: &CFString, value: &CFString) -> Result<()> {
-    let status = unsafe { session.set_property(key, Some(value.as_opaque())) };
+    let status = set_property(session, key, value);
     if status != 0 {
         return Err(anyhow!("VTSessionSetProperty(CFString) failed: {status}"));
     }
@@ -239,27 +236,23 @@ extern "C-unwind" fn output_callback(
 fn is_sync_sample(sample: &CMSampleBuffer) -> bool {
     // The sample buffer's first attachment has kCMSampleAttachmentKey_NotSync set to true
     // for non-keyframes. Absence of NotSync (or NotSync == false) means it's a keyframe.
-    // For v0 simplicity, treat absence-of-attachments-array as keyframe.
-    unsafe {
-        let attachments = sample.sample_attachments_array(false);
-        match attachments {
-            None => true,
-            Some(arr) => {
-                if arr.count() == 0 {
-                    return true;
-                }
-                let first = arr.value_at_index(0);
-                // If the dict says NotSync = true, it's a delta frame.
-                !cf_dict_get_bool(first, "NotSync")
-            }
-        }
-    }
+    // For v0 simplicity, conservatively treat frames as keyframes until the CFDictionary
+    // attachment lookup is bound; this may prepend parameter sets more often than needed.
+    let _ = sample;
+    true
 }
 
-// Minimal CFDictionary boolean lookup helper — keeps us off the full CF dance for one key.
-unsafe fn cf_dict_get_bool(_dict: &CFDictionary, _key: &str) -> bool {
-    // TODO: bind CFDictionaryGetValue + CFBooleanGetValue here. For v0 we conservatively
-    // assume keyframe (false = "NotSync absent"); worst case we emit parameter sets too
-    // often, which only wastes a few bytes per frame.
-    false
+fn set_property<T>(session: &VTCompressionSession, key: &CFString, value: &T) -> i32 {
+    let session = unsafe { &*(session as *const VTCompressionSession as *const CFType) };
+    let value = unsafe { &*(value as *const T as *const CFType) };
+    unsafe { VTSessionSetProperty(session, key, Some(value)) }
+}
+
+fn invalid_time() -> CMTime {
+    CMTime {
+        value: 0,
+        timescale: 0,
+        flags: objc2_core_media::CMTimeFlags::empty(),
+        epoch: 0,
+    }
 }

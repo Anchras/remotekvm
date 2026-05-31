@@ -4,6 +4,8 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+pub const DEEP_LINK_SCHEME: &str = "remotekvm";
+pub const DEEP_LINK_AUTH_URI: &str = "remotekvm://auth";
 const KEYRING_SERVICE: &str = "io.anchras.remotekvm";
 const KEYRING_USER: &str = "session-jwt";
 
@@ -150,8 +152,53 @@ fn extract_token(path: &str) -> Result<String> {
     let url = url::Url::parse(&format!("http://localhost{path}"))
         .context("failed to parse callback path")?;
 
+    extract_auth_token_from_pairs(url.query_pairs())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeepLink {
+    AuthToken(String),
+}
+
+/// Parse a `remotekvm://` URL delivered by the OS protocol handler.
+///
+/// The auth callback form is `remotekvm://auth?token=<jwt>`. For convenience in
+/// tests and manual invocations we also accept `remotekvm:///auth?token=<jwt>`.
+pub fn parse_deep_link(raw: &str) -> Result<DeepLink> {
+    let url = url::Url::parse(raw).context("failed to parse deep link URL")?;
+    if url.scheme() != DEEP_LINK_SCHEME {
+        return Err(anyhow!("unsupported deep link scheme: {}", url.scheme()));
+    }
+
+    let route = match (url.host_str(), url.path()) {
+        (Some("auth"), "" | "/") | (None, "/auth") => "auth",
+        (Some(host), _) => return Err(anyhow!("unsupported deep link route: {host}")),
+        (None, path) => return Err(anyhow!("unsupported deep link route: {path}")),
+    };
+
+    match route {
+        "auth" => extract_auth_token_from_pairs(url.query_pairs()).map(DeepLink::AuthToken),
+        _ => unreachable!("route was validated above"),
+    }
+}
+
+pub fn deep_link_args<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: Into<String>,
+{
+    args.into_iter()
+        .map(Into::into)
+        .filter(|arg| arg.starts_with(&format!("{DEEP_LINK_SCHEME}:")))
+        .collect()
+}
+
+fn extract_auth_token_from_pairs<'a, I>(pairs: I) -> Result<String>
+where
+    I: IntoIterator<Item = (std::borrow::Cow<'a, str>, std::borrow::Cow<'a, str>)>,
+{
     let mut token = None;
-    for (k, v) in url.query_pairs() {
+    for (k, v) in pairs {
         match k.as_ref() {
             "error" => return Err(anyhow!("login failed: {v}")),
             "token" => token = Some(v.into_owned()),
@@ -251,6 +298,42 @@ mod tests {
     #[test]
     fn extract_token_missing_is_error() {
         assert!(extract_token("/callback").is_err());
+    }
+
+    #[test]
+    fn parse_deep_link_accepts_auth_token() {
+        assert_eq!(
+            parse_deep_link("remotekvm://auth?token=abc.def.ghi").unwrap(),
+            DeepLink::AuthToken("abc.def.ghi".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_deep_link_accepts_path_auth_form() {
+        assert_eq!(
+            parse_deep_link("remotekvm:///auth?token=jwt-123").unwrap(),
+            DeepLink::AuthToken("jwt-123".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_deep_link_surfaces_auth_error() {
+        let err = parse_deep_link("remotekvm://auth?error=access_denied").unwrap_err();
+        assert!(err.to_string().contains("access_denied"));
+    }
+
+    #[test]
+    fn parse_deep_link_rejects_other_routes() {
+        assert!(parse_deep_link("remotekvm://connect?machine_id=abc").is_err());
+        assert!(parse_deep_link("https://example.com/auth?token=abc").is_err());
+    }
+
+    #[test]
+    fn deep_link_args_filters_protocol_urls() {
+        assert_eq!(
+            deep_link_args(["bin", "remotekvm://auth?token=abc", "--flag"]),
+            vec!["remotekvm://auth?token=abc".to_string()]
+        );
     }
 
     #[tokio::test]

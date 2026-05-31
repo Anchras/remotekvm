@@ -36,6 +36,8 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres/remotekvm
       REDIS_URL: redis://redis:6379
+      SIGNALING_INSTANCE_ID: compose-server
+      SIGNALING_TTL_SECONDS: 90
       PORT: 8080
       RUST_LOG: info,remotekvm_server=debug
     ports:

@@ -9,8 +9,7 @@ name = "remotekvm-agent"
 path = "src/main.rs"
 
 [features]
-# Opt-in legacy macOS capture/encode pipeline (ScreenCaptureKit + VideoToolbox).
-# Not yet adapted to the SaaS session; enable with `--features macos_v0`.
+# Opt-in macOS capture/encode pipeline (ScreenCaptureKit + VideoToolbox H.264).
 macos_v0 = []
 
 [dependencies]
@@ -32,6 +31,7 @@ urlencoding = "2"
 futures = "0.3"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+opus = "0.3.1"
 windows-service = "0.7"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
@@ -46,6 +46,12 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",
     "Win32_Media_DirectShow",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_System_Com",
+    "Win32_System_Environment",
+    "Win32_System_LibraryLoader",
+    "Win32_System_RemoteDesktop",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

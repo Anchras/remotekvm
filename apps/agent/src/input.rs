@@ -1,8 +1,8 @@
 //! Platform input injection for received [`InputEvent`]s.
 //!
-//! macOS uses CoreGraphics event posting (`core-graphics`). Other platforms
-//! currently log the event (Windows `SendInput` lands with the Windows agent in
-//! Phase 1). Injection requires OS permission at runtime (macOS: Accessibility).
+//! macOS uses CoreGraphics event posting (`core-graphics`). Windows uses
+//! `SendInput`. Other platforms currently log the event. Injection requires OS
+//! permission at runtime (macOS: Accessibility).
 
 use remotekvm_protocol::InputEvent;
 use std::sync::Mutex;
@@ -37,7 +37,10 @@ impl InputInjector {
         #[cfg(target_os = "macos")]
         macos::inject(self.last_pos.lock().unwrap().to_owned(), event);
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        crate::windows::input::inject(self.last_pos.lock().unwrap().to_owned(), event);
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         tracing::debug!(?event, "input injection not implemented on this platform");
     }
 }

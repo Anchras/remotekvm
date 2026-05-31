@@ -82,6 +82,7 @@ pub async fn workos_callback(
         upsert_organization(&state.db, org_membership).await?;
         upsert_membership(&state.db, &user.id, org_membership).await?;
     }
+    accept_pending_invites(&state.db, &user.id, &profile.email).await?;
 
     // Create JWT session
     let token = create_token(
@@ -325,6 +326,35 @@ async fn upsert_membership(
     .bind(user_id)
     .bind(role)
     .bind(&membership.organization.id)
+    .execute(db.pool())
+    .await?;
+
+    Ok(())
+}
+
+async fn accept_pending_invites(
+    db: &Database,
+    user_id: &uuid::Uuid,
+    email: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        WITH accepted AS (
+            UPDATE organization_invites
+            SET accepted_at = NOW()
+            WHERE lower(email) = lower($2)
+              AND accepted_at IS NULL
+            RETURNING organization_id, role
+        )
+        INSERT INTO organization_members (organization_id, user_id, role)
+        SELECT organization_id, $1, role
+        FROM accepted
+        ON CONFLICT (organization_id, user_id) DO UPDATE SET
+            role = EXCLUDED.role
+        "#,
+    )
+    .bind(user_id)
+    .bind(email)
     .execute(db.pool())
     .await?;
 

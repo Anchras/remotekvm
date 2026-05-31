@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.remotekvm.agent</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/remotekvm-agent</string>
+    <string>--server-url</string>
+    <string>__SERVER_URL__</string>
+    <string>--width</string>
+    <string>1920</string>
+    <string>--height</string>
+    <string>1080</string>
+    <string>--fps</string>
+    <string>60</string>
+    <string>--bitrate-kbps</string>
+    <string>20000</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RKVM_REGISTRATION_TOKEN</key>
+    <string>__REGISTRATION_TOKEN__</string>
+    <key>RUST_LOG</key>
+    <string>info,remotekvm_agent=debug</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/remotekvm-agent.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/remotekvm-agent.err.log</string>
+</dict>
+</plist>
