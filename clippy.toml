@@ -1,0 +1,4 @@
+# Match the workspace MSRV (workspace.package.rust-version). Keeps clippy from
+# suggesting APIs newer than our minimum supported Rust (e.g. `u32::is_multiple_of`,
+# stabilized in 1.87) while still flagging lints whose fix is available at 1.78.
+msrv = "1.78"
