@@ -1557,6 +1557,107 @@ async fn stripe_webhook_verifies_signature_and_persists_customer(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn stripe_webhook_rechecks_org_admin_before_team_upgrade(pool: PgPool) {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let admin = insert_user(&pool, "workos_admin", "admin@example.com").await;
+    let member = insert_user(&pool, "workos_member", "member@example.com").await;
+    let org: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO organizations (workos_org_id, name, slug)
+        VALUES ('org_acme', 'Acme Corp', 'acme')
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO organization_members (organization_id, user_id, role)
+        VALUES ($1, $2, 'admin'), ($1, $3, 'member')
+        "#,
+    )
+    .bind(org)
+    .bind(admin)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+
+    let sign = |body: &str| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"whsec_test").unwrap();
+        mac.update(now.to_string().as_bytes());
+        mac.update(b".");
+        mac.update(body.as_bytes());
+        format!("t={now},v1={}", hex::encode(mac.finalize().into_bytes()))
+    };
+
+    let forged_org_body = json!({
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": member.to_string(),
+            "customer": "cus_member",
+            "subscription": "sub_member",
+            "metadata": { "organization_id": org.to_string() }
+        }}
+    })
+    .to_string();
+    let resp = srv
+        .http
+        .post(srv.url("/webhooks/stripe"))
+        .header("Stripe-Signature", sign(&forged_org_body))
+        .body(forged_org_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let org_plan: String = sqlx::query_scalar("SELECT plan FROM organizations WHERE id = $1")
+        .bind(org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(org_plan, "free");
+
+    let admin_body = json!({
+        "type": "checkout.session.completed",
+        "data": { "object": {
+            "client_reference_id": admin.to_string(),
+            "customer": "cus_admin",
+            "subscription": "sub_admin",
+            "metadata": { "organization_id": org.to_string() }
+        }}
+    })
+    .to_string();
+    let resp = srv
+        .http
+        .post(srv.url("/webhooks/stripe"))
+        .header("Stripe-Signature", sign(&admin_body))
+        .body(admin_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let (org_plan, subscription_id): (String, Option<String>) =
+        sqlx::query_as("SELECT plan, stripe_subscription_id FROM organizations WHERE id = $1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(org_plan, "team");
+    assert_eq!(subscription_id.as_deref(), Some("sub_admin"));
+}
+
+#[sqlx::test]
 async fn agent_with_invalid_token_is_rejected(pool: PgPool) {
     let srv = spawn(build_state(pool, "http://unused".into())).await;
     let result =
