@@ -12,7 +12,7 @@
 
 use anyhow::{anyhow, Result};
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFBoolean, CFNumber, CFString, CFType};
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_media::{kCMVideoCodecType_H264, CMSampleBuffer, CMTime};
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
@@ -236,10 +236,21 @@ extern "C-unwind" fn output_callback(
 fn is_sync_sample(sample: &CMSampleBuffer) -> bool {
     // The sample buffer's first attachment has kCMSampleAttachmentKey_NotSync set to true
     // for non-keyframes. Absence of NotSync (or NotSync == false) means it's a keyframe.
-    // For v0 simplicity, conservatively treat frames as keyframes until the CFDictionary
-    // attachment lookup is bound; this may prepend parameter sets more often than needed.
-    let _ = sample;
-    true
+    // For v0 simplicity, treat absence-of-attachments-array as keyframe.
+    unsafe {
+        let attachments = sample.sample_attachments_array(false);
+        match attachments {
+            None => true,
+            Some(arr) => {
+                if arr.count() == 0 {
+                    return true;
+                }
+                let first = arr.value_at_index(0);
+                // If the dict says NotSync = true, it's a delta frame.
+                !cf_dict_get_bool(first, "NotSync")
+            }
+        }
+    }
 }
 
 fn set_property<T>(session: &VTCompressionSession, key: &CFString, value: &T) -> i32 {
@@ -255,4 +266,10 @@ fn invalid_time() -> CMTime {
         flags: objc2_core_media::CMTimeFlags::empty(),
         epoch: 0,
     }
+}
+
+unsafe fn cf_dict_get_bool(dict: &CFDictionary, key: &str) -> bool {
+    let key = CFString::from_str(key);
+    let value = unsafe { dict.get_unchecked(&*key) };
+    value.is_some_and(CFBoolean::value)
 }

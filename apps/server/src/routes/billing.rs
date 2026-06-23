@@ -214,11 +214,52 @@ pub async fn stripe_webhook(
                 (object["client_reference_id"].as_str(), customer)
             {
                 if let Ok(uid) = uuid::Uuid::parse_str(user_id) {
-                    sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
-                        .bind(customer)
+                    if let Some(org_id) = object["metadata"]["organization_id"]
+                        .as_str()
+                        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+                    {
+                        let can_admin_org: bool = sqlx::query_scalar(
+                            r#"
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM organization_members
+                                WHERE organization_id = $1
+                                  AND user_id = $2
+                                  AND role IN ('owner', 'admin')
+                            )
+                            "#,
+                        )
+                        .bind(org_id)
                         .bind(uid)
-                        .execute(state.db.pool())
+                        .fetch_one(state.db.pool())
                         .await?;
+
+                        if can_admin_org {
+                            sqlx::query(
+                                r#"
+                                UPDATE organizations
+                                SET plan = 'team', stripe_subscription_id = $1
+                                WHERE id = $2
+                                "#,
+                            )
+                            .bind(object["subscription"].as_str())
+                            .bind(org_id)
+                            .execute(state.db.pool())
+                            .await?;
+                        } else {
+                            tracing::warn!(
+                                user_id = %uid,
+                                organization_id = %org_id,
+                                "ignoring checkout completion for org without admin membership"
+                            );
+                        }
+                    } else {
+                        sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
+                            .bind(customer)
+                            .bind(uid)
+                            .execute(state.db.pool())
+                            .await?;
+                    }
                 }
             }
         }
