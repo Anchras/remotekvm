@@ -484,7 +484,7 @@ fn cpal_audio_thread(
 fn audio_frame_to_f32(frame: &DecodedAudioFrame) -> Result<Vec<f32>> {
     match frame.format {
         AudioSampleFormat::F32Interleaved => {
-            if frame.data.len() % std::mem::size_of::<f32>() != 0 {
+            if !frame.data.len().is_multiple_of(std::mem::size_of::<f32>()) {
                 anyhow::bail!("f32 audio payload is not sample aligned");
             }
             Ok(frame
@@ -494,7 +494,7 @@ fn audio_frame_to_f32(frame: &DecodedAudioFrame) -> Result<Vec<f32>> {
                 .collect())
         }
         AudioSampleFormat::I16Interleaved => {
-            if frame.data.len() % std::mem::size_of::<i16>() != 0 {
+            if !frame.data.len().is_multiple_of(std::mem::size_of::<i16>()) {
                 anyhow::bail!("i16 audio payload is not sample aligned");
             }
             Ok(frame
@@ -856,7 +856,7 @@ mod platform {
             }
 
             pub(super) fn matches_parameter_sets(&self, sps: &Bytes, pps: &Bytes) -> bool {
-                &self.sps == sps && &self.pps == pps
+                self.sps == *sps && self.pps == *pps
             }
 
             pub(super) fn decode(
@@ -1968,7 +1968,7 @@ fn copy_strided_nv12(
     stride: usize,
     top_down: bool,
 ) -> Result<Vec<u8>> {
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         anyhow::bail!("NV12 frame dimensions must be even");
     }
     let width = width as usize;

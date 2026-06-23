@@ -102,7 +102,7 @@ fn decoded_frame_to_rgba(frame: &DecodedVideoFrame) -> Result<Vec<u8>> {
 
 fn nv12_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
     let y_len = width * height;
-    let uv_height = (height + 1) / 2;
+    let uv_height = height.div_ceil(2);
     let expected = y_len + width * uv_height;
     if data.len() < expected {
         anyhow::bail!(
@@ -126,8 +126,8 @@ fn nv12_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
 
 fn i420_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
     let y_len = width * height;
-    let chroma_width = (width + 1) / 2;
-    let chroma_height = (height + 1) / 2;
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
     let chroma_len = chroma_width * chroma_height;
     let u_offset = y_len;
     let v_offset = u_offset + chroma_len;
