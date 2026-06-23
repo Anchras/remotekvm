@@ -26,6 +26,9 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::rtp_transceiver::rtp_codec::RTPCodecType;
+use webrtc::rtp_transceiver::rtp_transceiver_direction::RTCRtpTransceiverDirection;
+use webrtc::rtp_transceiver::RTCRtpTransceiverInit;
 
 /// Build a PeerConnection with sane low-latency defaults.
 ///
@@ -82,6 +85,15 @@ impl PeerSession {
 
         wire_ice(&pc, ice_tx);
         wire_connection_state(&pc);
+
+        pc.add_transceiver_from_kind(
+            RTPCodecType::Video,
+            Some(RTCRtpTransceiverInit {
+                direction: RTCRtpTransceiverDirection::Recvonly,
+                send_encodings: vec![],
+            }),
+        )
+        .await?;
 
         let dc = pc.create_data_channel(CONTROL_CHANNEL, None).await?;
         wire_data_channel(&dc, incoming_tx, channel_open.clone());
