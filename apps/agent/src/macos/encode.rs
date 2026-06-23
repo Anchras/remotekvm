@@ -13,7 +13,9 @@
 use anyhow::{anyhow, Result};
 use objc2::rc::Retained;
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
-use objc2_core_media::{kCMVideoCodecType_H264, CMSampleBuffer, CMTime};
+use objc2_core_media::{
+    kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, CMSampleBuffer, CMTime,
+};
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
@@ -247,7 +249,7 @@ fn is_sync_sample(sample: &CMSampleBuffer) -> bool {
                 }
                 let first = arr.value_at_index(0);
                 // If the dict says NotSync = true, it's a delta frame.
-                !cf_dict_get_bool(first, "NotSync")
+                !cf_dict_get_bool(first, unsafe { kCMSampleAttachmentKey_NotSync })
             }
         }
     }
@@ -268,8 +270,7 @@ fn invalid_time() -> CMTime {
     }
 }
 
-unsafe fn cf_dict_get_bool(dict: &CFDictionary, key: &str) -> bool {
-    let key = CFString::from_str(key);
-    let value = unsafe { dict.get_unchecked(&*key) };
+unsafe fn cf_dict_get_bool(dict: &CFDictionary, key: &CFString) -> bool {
+    let value = unsafe { dict.get_unchecked(key) };
     value.is_some_and(CFBoolean::value)
 }
