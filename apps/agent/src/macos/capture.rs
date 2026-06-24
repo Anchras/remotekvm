@@ -158,6 +158,99 @@ async fn get_shareable_content() -> Result<Retained<SCShareableContent>> {
         .map_err(|e| anyhow!("SCShareableContent fetch failed: {:?}", e))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::macos::encode::{Encoder, EncoderConfig};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// End-to-end on real hardware: ScreenCaptureKit captures the live display,
+    /// VideoToolbox encodes H.264, and we confirm non-empty Annex-B frames arrive.
+    ///
+    /// Requires **Screen Recording permission** for the test runner. If no display
+    /// is shareable (permission not granted / headless), the test skips with a
+    /// message rather than failing — there is nothing to capture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn captures_and_encodes_real_screen_to_h264() {
+        // Probe permission first so a denial reads as a skip, not a hard failure.
+        match get_shareable_content().await {
+            Ok(content) => {
+                let displays = unsafe { content.displays() };
+                if displays.firstObject().is_none() {
+                    eprintln!(
+                        "SKIP: no shareable display (grant Screen Recording permission to verify capture)"
+                    );
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("SKIP: cannot list shareable content ({e}); Screen Recording permission likely not granted");
+                return;
+            }
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let encoder = Arc::new(
+            Encoder::new(
+                EncoderConfig {
+                    width: 640,
+                    height: 480,
+                    bitrate_kbps: 2_000,
+                },
+                tx,
+            )
+            .expect("create VideoToolbox H.264 encoder"),
+        );
+
+        let capturer = Capturer::start(
+            CapturerConfig {
+                width: 640,
+                height: 480,
+                fps: 15,
+            },
+            encoder,
+        )
+        .await
+        .expect("start ScreenCaptureKit capture");
+
+        // Collect a few encoded frames within a bounded window.
+        let mut frames = 0u32;
+        let mut total_bytes = 0usize;
+        let mut keyframes = 0u32;
+        let overall = tokio::time::Instant::now();
+        while frames < 5 && overall.elapsed() < Duration::from_secs(8) {
+            match tokio::time::timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some(frame)) => {
+                    frames += 1;
+                    total_bytes += frame.data.len();
+                    if frame.is_keyframe {
+                        keyframes += 1;
+                    }
+                    // Annex-B access units must start with a 00 00 00 01 / 00 00 01 start code.
+                    assert!(
+                        frame.data.starts_with(&[0, 0, 0, 1]) || frame.data.starts_with(&[0, 0, 1]),
+                        "encoded frame is not Annex-B (no start code): {:?}",
+                        &frame.data[..frame.data.len().min(8)]
+                    );
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        capturer.stop().await.expect("stop capture");
+
+        assert!(
+            frames > 0 && total_bytes > 0,
+            "no H.264 frames produced from live capture"
+        );
+        eprintln!(
+            "VERIFIED: live capture produced {frames} H.264 frame(s), {total_bytes} bytes, {keyframes} keyframe(s)"
+        );
+    }
+}
+
 pub struct FrameSinkIvars {
     encoder: Arc<Encoder>,
 }

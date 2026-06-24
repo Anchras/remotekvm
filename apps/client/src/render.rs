@@ -103,7 +103,12 @@ fn decoded_frame_to_rgba(frame: &DecodedVideoFrame) -> Result<Vec<u8>> {
 fn nv12_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
     let y_len = width * height;
     let uv_height = height.div_ceil(2);
-    let expected = y_len + width * uv_height;
+    // NV12 chroma is interleaved (U,V per 2x2 block) with one chroma sample per
+    // pair of luma columns, so each chroma row is `2 * ceil(width / 2)` bytes —
+    // i.e. width rounded up to an even number. Using a bare `width` stride
+    // under-sizes the plane for odd widths and reads one byte past the buffer.
+    let uv_stride = width.div_ceil(2) * 2;
+    let expected = y_len + uv_stride * uv_height;
     if data.len() < expected {
         anyhow::bail!(
             "NV12 frame too small: got {}, expected at least {expected}",
@@ -115,7 +120,7 @@ fn nv12_to_rgba(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
     for y in 0..height {
         for x in 0..width {
             let luma = data[y * width + x];
-            let uv_index = y_len + (y / 2) * width + (x / 2) * 2;
+            let uv_index = y_len + (y / 2) * uv_stride + (x / 2) * 2;
             let u = data[uv_index];
             let v = data[uv_index + 1];
             push_yuv_as_rgba(&mut rgba, luma, u, v);
@@ -317,6 +322,40 @@ mod tests {
             decoded_frame_to_rgba(&frame).unwrap(),
             vec![64, 64, 64, 255, 128, 128, 128, 255, 192, 192, 192, 255, 255, 255, 255, 255,]
         );
+    }
+
+    #[test]
+    fn nv12_odd_width_does_not_read_past_buffer() {
+        // Odd width: the interleaved chroma row is padded to an even byte
+        // width (2 * ceil(3/2) = 4), not `width` (3). A bare-`width` stride
+        // panicked reading `data[uv_index + 1]` one byte past the plane.
+        let frame = DecodedVideoFrame {
+            width: 3,
+            height: 2,
+            format: VideoPixelFormat::Nv12,
+            pts: None,
+            // 6 luma bytes + one 4-byte neutral chroma row (2 chroma samples).
+            data: Bytes::from_static(&[0, 1, 2, 3, 4, 5, 128, 128, 128, 128]),
+        };
+
+        // Neutral chroma => each pixel is its luma value as gray.
+        let rgba = decoded_frame_to_rgba(&frame).unwrap();
+        assert_eq!(rgba.len(), 3 * 2 * 4);
+        assert_eq!(&rgba[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&rgba[20..24], &[5, 5, 5, 255]);
+    }
+
+    #[test]
+    fn nv12_undersized_buffer_is_rejected_not_panicked() {
+        // A 3x2 NV12 frame needs 10 bytes; a short buffer must error, not panic.
+        let frame = DecodedVideoFrame {
+            width: 3,
+            height: 2,
+            format: VideoPixelFormat::Nv12,
+            pts: None,
+            data: Bytes::from_static(&[0, 1, 2, 3, 4, 5, 128, 128, 128]),
+        };
+        assert!(decoded_frame_to_rgba(&frame).is_err());
     }
 
     async fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {

@@ -1048,6 +1048,111 @@ async fn signaling_relay_end_to_end(pool: PgPool) {
     assert_eq!(list["sessions"][0]["status"], "ended");
 }
 
+/// A compromised agent (holding a valid token for machine B) must not be able
+/// to answer or send ICE for a session that belongs to machine A — doing so
+/// would inject its SDP into another tenant's WebRTC negotiation. The server
+/// binds every relayed agent message to a session owned by that machine.
+#[sqlx::test]
+async fn agent_cannot_relay_signaling_for_foreign_session(pool: PgPool) {
+    let user = insert_user(&pool, "workos_owner", "owner@example.com").await;
+    let jwt = jwt_for(user, "owner@example.com");
+    let srv = spawn(build_state(pool.clone(), "http://unused".into())).await;
+
+    let (machine_a, token_a) = register_machine(&srv, &jwt, "Machine A").await;
+    let (_machine_b, token_b) = register_machine(&srv, &jwt, "Machine B").await;
+
+    // Agent A comes online; obtain a session that belongs to machine A.
+    let (mut agent_a, _) =
+        tokio_tungstenite::connect_async(srv.ws_url(&format!("/agent?token={token_a}")))
+            .await
+            .expect("agent A websocket connect");
+    let session_id = {
+        let mut got = None;
+        for _ in 0..50 {
+            let resp = srv
+                .http
+                .post(srv.url(&format!("/api/machines/{machine_a}/connect")))
+                .bearer_auth(&jwt)
+                .send()
+                .await
+                .unwrap();
+            if resp.status() == 200 {
+                let body: Value = resp.json().await.unwrap();
+                got = Some(body["session_id"].as_str().unwrap().to_string());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        got.expect("connect never succeeded for machine A")
+    };
+
+    // Client offers for machine A's session.
+    let (mut client_ws, _) =
+        tokio_tungstenite::connect_async(srv.ws_url(&format!("/client?token={jwt}")))
+            .await
+            .expect("client websocket connect");
+    client_ws
+        .send(Message::Text(
+            serde_json::to_string(&SignalingMessage::ConnectRequest {
+                session_id: session_id.clone(),
+                client_id: String::new(),
+                offer: "OFFER_SDP".to_string(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    // Drain the relayed offer on agent A so its socket stays healthy.
+    let _ = next_signaling(&mut agent_a).await;
+
+    // Agent B (different machine) tries to answer machine A's session.
+    let (mut agent_b, _) =
+        tokio_tungstenite::connect_async(srv.ws_url(&format!("/agent?token={token_b}")))
+            .await
+            .expect("agent B websocket connect");
+    agent_b
+        .send(Message::Text(
+            serde_json::to_string(&SignalingMessage::SignalingAnswer {
+                session_id: session_id.clone(),
+                answer: "EVIL_SDP".to_string(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    // The forged answer must NOT reach the client, and must not activate the session.
+    let relayed = tokio::time::timeout(Duration::from_millis(500), client_ws.next()).await;
+    assert!(
+        relayed.is_err(),
+        "client must not receive a foreign agent's answer, got {relayed:?}"
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM sessions WHERE id = $1")
+        .bind(Uuid::parse_str(&session_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "pending", "foreign answer must not activate session");
+
+    // The legitimate owner (agent A) can still answer — the guard does not block it.
+    agent_a
+        .send(Message::Text(
+            serde_json::to_string(&SignalingMessage::SignalingAnswer {
+                session_id: session_id.clone(),
+                answer: "GOOD_SDP".to_string(),
+            })
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    match next_signaling(&mut client_ws).await {
+        SignalingMessage::ConnectResponse { answer, status, .. } => {
+            assert_eq!(status, "accepted");
+            assert_eq!(answer.as_deref(), Some("GOOD_SDP"));
+        }
+        other => panic!("client expected ConnectResponse, got {other:?}"),
+    }
+}
 // ---------------------------------------------------------------------------
 // Native loopback login flow
 // ---------------------------------------------------------------------------

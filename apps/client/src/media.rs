@@ -484,7 +484,7 @@ fn cpal_audio_thread(
 fn audio_frame_to_f32(frame: &DecodedAudioFrame) -> Result<Vec<f32>> {
     match frame.format {
         AudioSampleFormat::F32Interleaved => {
-            if !frame.data.len().is_multiple_of(std::mem::size_of::<f32>()) {
+            if frame.data.len() % std::mem::size_of::<f32>() != 0 {
                 anyhow::bail!("f32 audio payload is not sample aligned");
             }
             Ok(frame
@@ -494,7 +494,7 @@ fn audio_frame_to_f32(frame: &DecodedAudioFrame) -> Result<Vec<f32>> {
                 .collect())
         }
         AudioSampleFormat::I16Interleaved => {
-            if !frame.data.len().is_multiple_of(std::mem::size_of::<i16>()) {
+            if frame.data.len() % std::mem::size_of::<i16>() != 0 {
                 anyhow::bail!("i16 audio payload is not sample aligned");
             }
             Ok(frame
@@ -1112,6 +1112,11 @@ mod platform {
             }
             let bytes_per_row = CVPixelBufferGetBytesPerRow(pixel_buffer);
             let row_len = width as usize * 4;
+            if bytes_per_row < row_len {
+                return Err(anyhow!(
+                    "packed CVPixelBuffer stride {bytes_per_row} < row {row_len}"
+                ));
+            }
             let mut out = Vec::with_capacity(row_len * height as usize);
             for row in 0..height as usize {
                 let row_start = unsafe { base.add(row * bytes_per_row) };
@@ -1146,6 +1151,11 @@ mod platform {
                 let plane_width = CVPixelBufferGetWidthOfPlane(pixel_buffer, plane);
                 let plane_height = CVPixelBufferGetHeightOfPlane(pixel_buffer, plane);
                 let bytes_per_row = CVPixelBufferGetBytesPerRowOfPlane(pixel_buffer, plane);
+                if bytes_per_row < plane_width {
+                    return Err(anyhow!(
+                        "NV12 plane {plane} stride {bytes_per_row} < width {plane_width}"
+                    ));
+                }
                 for row in 0..plane_height {
                     let row_start = unsafe { base.add(row * bytes_per_row) };
                     out.extend_from_slice(unsafe {
@@ -1821,6 +1831,12 @@ struct H264AccessUnitAssembler {
     pending_timestamp: Option<u32>,
 }
 
+/// Upper bound on a single in-flight access unit. A misbehaving or malicious
+/// peer that never sets the RTP marker bit (and reuses one timestamp) would
+/// otherwise grow `pending_annex_b` without limit. 16 MiB comfortably covers a
+/// 4K intra frame while bounding memory against adversarial input.
+const MAX_PENDING_ACCESS_UNIT_BYTES: usize = 16 * 1024 * 1024;
+
 impl H264AccessUnitAssembler {
     fn push_rtp(&mut self, packet: EncodedMediaPacket) -> Result<Option<H264AccessUnit>> {
         use rtp::packetizer::Depacketizer;
@@ -1851,6 +1867,15 @@ impl H264AccessUnitAssembler {
             }));
         }
 
+        if self.pending_annex_b.len() + annex_b.len() > MAX_PENDING_ACCESS_UNIT_BYTES {
+            // Resync: discard the oversized partial unit rather than let a peer
+            // that never marks an access-unit boundary exhaust memory.
+            self.pending_annex_b.clear();
+            self.pending_timestamp = None;
+            anyhow::bail!(
+                "H.264 access unit exceeded {MAX_PENDING_ACCESS_UNIT_BYTES} bytes without a frame boundary; resyncing"
+            );
+        }
         self.pending_annex_b.extend_from_slice(&annex_b);
         if packet.marker {
             let timestamp = self.pending_timestamp.take().unwrap_or(packet.timestamp);
@@ -1968,7 +1993,7 @@ fn copy_strided_nv12(
     stride: usize,
     top_down: bool,
 ) -> Result<Vec<u8>> {
-    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+    if width % 2 != 0 || height % 2 != 0 {
         anyhow::bail!("NV12 frame dimensions must be even");
     }
     let width = width as usize;

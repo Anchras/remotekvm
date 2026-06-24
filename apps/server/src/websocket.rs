@@ -52,6 +52,12 @@ struct AgentPresence {
     conn_id: u64,
 }
 
+impl Default for SignalingState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SignalingState {
     pub fn new() -> Self {
         Self {
@@ -600,6 +606,17 @@ async fn handle_agent_message(
 
     match msg {
         SignalingMessage::SignalingAnswer { session_id, answer } => {
+            // A compromised agent must not be able to answer (and thus inject its
+            // SDP into) a session that belongs to a different machine, nor inflate
+            // another session's usage counters. Bind every relayed message to a
+            // session owned by this authenticated machine.
+            if !session_belongs_to_machine(state, &session_id, machine_id).await? {
+                warn!(
+                    machine_id,
+                    session_id, "agent sent answer for a session it does not own; dropping"
+                );
+                return Ok(());
+            }
             mark_session_active(state, &session_id).await?;
             record_session_usage(state, &session_id, text.len() as i64, 0).await?;
             // Forward answer to the client
@@ -619,6 +636,13 @@ async fn handle_agent_message(
             session_id,
             candidate,
         } => {
+            if !session_belongs_to_machine(state, &session_id, machine_id).await? {
+                warn!(
+                    machine_id,
+                    session_id, "agent sent ICE for a session it does not own; dropping"
+                );
+                return Ok(());
+            }
             record_session_usage(state, &session_id, text.len() as i64, 0).await?;
             // Forward ICE candidate to the client
             let _ = state
@@ -862,6 +886,25 @@ struct MachineIdRow {
 struct SessionOwnerRow {
     user_id: uuid::Uuid,
     machine_id: uuid::Uuid,
+}
+
+/// Whether `session_id` exists and is owned by `machine_id`. Used to reject an
+/// agent relaying signaling for sessions belonging to other machines/tenants.
+async fn session_belongs_to_machine(
+    state: &AppState,
+    session_id: &str,
+    machine_id: &str,
+) -> anyhow::Result<bool> {
+    let session_uuid = uuid::Uuid::parse_str(session_id)?;
+    let machine_uuid = uuid::Uuid::parse_str(machine_id)?;
+    let row = sqlx::query_scalar::<_, bool>(
+        r#"SELECT EXISTS(SELECT 1 FROM sessions WHERE id = $1 AND machine_id = $2)"#,
+    )
+    .bind(session_uuid)
+    .bind(machine_uuid)
+    .fetch_one(state.db.pool())
+    .await?;
+    Ok(row)
 }
 
 async fn mark_session_active(state: &AppState, session_id: &str) -> anyhow::Result<()> {
