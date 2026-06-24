@@ -194,32 +194,62 @@ pub async fn stripe_webhook(
             let org_id = object["metadata"]["organization_id"]
                 .as_str()
                 .and_then(|id| uuid::Uuid::parse_str(id).ok());
+            let user_id = object["client_reference_id"]
+                .as_str()
+                .and_then(|id| uuid::Uuid::parse_str(id).ok());
 
             if let (Some(org_id), Some(customer)) = (org_id, customer) {
-                sqlx::query(
-                    r#"
-                    UPDATE organizations
-                    SET stripe_customer_id = $1,
-                        stripe_subscription_id = COALESCE($2, stripe_subscription_id),
-                        plan = 'team'
-                    WHERE id = $3
-                    "#,
-                )
-                .bind(customer)
-                .bind(subscription)
-                .bind(org_id)
-                .execute(state.db.pool())
-                .await?;
-            } else if let (Some(user_id), Some(customer)) =
-                (object["client_reference_id"].as_str(), customer)
-            {
-                if let Ok(uid) = uuid::Uuid::parse_str(user_id) {
-                    sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
+                if let Some(uid) = user_id {
+                    let can_admin_org: bool = sqlx::query_scalar(
+                        r#"
+                        SELECT EXISTS(
+                            SELECT 1
+                            FROM organization_members
+                            WHERE organization_id = $1
+                              AND user_id = $2
+                              AND role IN ('owner', 'admin')
+                        )
+                        "#,
+                    )
+                    .bind(org_id)
+                    .bind(uid)
+                    .fetch_one(state.db.pool())
+                    .await?;
+
+                    if can_admin_org {
+                        sqlx::query(
+                            r#"
+                            UPDATE organizations
+                            SET stripe_customer_id = $1,
+                                stripe_subscription_id = COALESCE($2, stripe_subscription_id),
+                                plan = 'team'
+                            WHERE id = $3
+                            "#,
+                        )
                         .bind(customer)
-                        .bind(uid)
+                        .bind(subscription)
+                        .bind(org_id)
                         .execute(state.db.pool())
                         .await?;
+                    } else {
+                        tracing::warn!(
+                            user_id = %uid,
+                            organization_id = %org_id,
+                            "ignoring checkout completion for org without admin membership"
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        organization_id = %org_id,
+                        "ignoring organization checkout completion without valid client reference"
+                    );
                 }
+            } else if let (Some(uid), Some(customer)) = (user_id, customer) {
+                sqlx::query("UPDATE users SET stripe_customer_id = $1 WHERE id = $2")
+                    .bind(customer)
+                    .bind(uid)
+                    .execute(state.db.pool())
+                    .await?;
             }
         }
         "customer.subscription.deleted" => {

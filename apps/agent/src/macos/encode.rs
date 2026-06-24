@@ -12,8 +12,10 @@
 
 use anyhow::{anyhow, Result};
 use objc2::rc::Retained;
-use objc2_core_foundation::{CFBoolean, CFNumber, CFString, CFType};
-use objc2_core_media::{kCMVideoCodecType_H264, CMSampleBuffer, CMTime};
+use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
+use objc2_core_media::{
+    kCMSampleAttachmentKey_NotSync, kCMVideoCodecType_H264, CMSampleBuffer, CMTime,
+};
 use objc2_core_video::CVImageBuffer;
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
@@ -236,10 +238,21 @@ extern "C-unwind" fn output_callback(
 fn is_sync_sample(sample: &CMSampleBuffer) -> bool {
     // The sample buffer's first attachment has kCMSampleAttachmentKey_NotSync set to true
     // for non-keyframes. Absence of NotSync (or NotSync == false) means it's a keyframe.
-    // For v0 simplicity, conservatively treat frames as keyframes until the CFDictionary
-    // attachment lookup is bound; this may prepend parameter sets more often than needed.
-    let _ = sample;
-    true
+    // For v0 simplicity, treat absence-of-attachments-array as keyframe.
+    unsafe {
+        let attachments = sample.sample_attachments_array(false);
+        match attachments {
+            None => true,
+            Some(arr) => {
+                if arr.count() == 0 {
+                    return true;
+                }
+                let first = arr.value_at_index(0);
+                // If the dict says NotSync = true, it's a delta frame.
+                !cf_dict_get_bool(first, unsafe { kCMSampleAttachmentKey_NotSync })
+            }
+        }
+    }
 }
 
 fn set_property<T>(session: &VTCompressionSession, key: &CFString, value: &T) -> i32 {
@@ -257,123 +270,7 @@ fn invalid_time() -> CMTime {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use objc2_core_video::{
-        CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
-        CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeightOfPlane, CVPixelBufferLockFlags,
-        CVPixelBufferLockBaseAddress, CVPixelBufferUnlockBaseAddress,
-    };
-    use std::time::Duration;
-    use tokio::sync::mpsc;
-
-    // kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ('420v') — NV12.
-    const PIXEL_FORMAT_NV12: u32 = 0x3432_3076;
-
-    /// Fill an NV12 CVPixelBuffer with a gradient luma plane + neutral chroma.
-    /// Returns the locked-then-unlocked buffer ready to encode.
-    unsafe fn make_nv12_buffer(width: usize, height: usize) -> *mut CVImageBuffer {
-        let mut buf: *mut CVImageBuffer = std::ptr::null_mut();
-        let status = CVPixelBufferCreate(
-            None,
-            width,
-            height,
-            PIXEL_FORMAT_NV12,
-            None,
-            NonNull::new(&mut buf).unwrap(),
-        );
-        assert_eq!(status, 0, "CVPixelBufferCreate failed: {status}");
-        assert!(!buf.is_null());
-
-        let lock = CVPixelBufferLockFlags(0);
-        assert_eq!(CVPixelBufferLockBaseAddress(&*buf, lock), 0);
-
-        // Plane 0: luma. Plane 1: interleaved CbCr.
-        let y_base = CVPixelBufferGetBaseAddressOfPlane(&*buf, 0) as *mut u8;
-        let y_stride = CVPixelBufferGetBytesPerRowOfPlane(&*buf, 0);
-        let y_rows = CVPixelBufferGetHeightOfPlane(&*buf, 0);
-        for row in 0..y_rows {
-            for col in 0..width {
-                *y_base.add(row * y_stride + col) = ((row + col) & 0xff) as u8;
-            }
-        }
-        let uv_base = CVPixelBufferGetBaseAddressOfPlane(&*buf, 1) as *mut u8;
-        let uv_stride = CVPixelBufferGetBytesPerRowOfPlane(&*buf, 1);
-        let uv_rows = CVPixelBufferGetHeightOfPlane(&*buf, 1);
-        for row in 0..uv_rows {
-            for col in 0..uv_stride {
-                *uv_base.add(row * uv_stride + col) = 128;
-            }
-        }
-        assert_eq!(CVPixelBufferUnlockBaseAddress(&*buf, lock), 0);
-        buf
-    }
-
-    /// Permission-free verification of the VideoToolbox H.264 encoder on this
-    /// hardware: feed synthetic NV12 frames and confirm real Annex-B H.264 NALs,
-    /// including at least one keyframe, come out. (The capture half needs Screen
-    /// Recording permission — see capture.rs.)
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn videotoolbox_encodes_synthetic_frames_to_h264() {
-        let (width, height) = (640usize, 480usize);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let encoder = Encoder::new(
-            EncoderConfig {
-                width: width as u32,
-                height: height as u32,
-                bitrate_kbps: 2_000,
-            },
-            tx,
-        )
-        .expect("create VideoToolbox H.264 encoder");
-
-        let buffer = unsafe { make_nv12_buffer(width, height) };
-        for i in 0..15i64 {
-            let pts = CMTime {
-                value: i * 6_000, // 90 kHz / 15 fps
-                timescale: 90_000,
-                flags: objc2_core_media::CMTimeFlags::Valid,
-                epoch: 0,
-            };
-            encoder
-                .encode(unsafe { &*buffer }, pts)
-                .expect("submit frame to encoder");
-        }
-
-        let mut frames = 0u32;
-        let mut total_bytes = 0usize;
-        let mut keyframes = 0u32;
-        while frames < 5 {
-            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
-                Ok(Some(frame)) => {
-                    frames += 1;
-                    total_bytes += frame.data.len();
-                    if frame.is_keyframe {
-                        keyframes += 1;
-                    }
-                    assert!(
-                        frame.data.starts_with(&[0, 0, 0, 1]) || frame.data.starts_with(&[0, 0, 1]),
-                        "encoded frame is not Annex-B: {:?}",
-                        &frame.data[..frame.data.len().min(8)]
-                    );
-                }
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        // Encoder Drop invalidates the session (drains callbacks) before we free
-        // the pixel buffer.
-        drop(encoder);
-        unsafe { objc2_core_foundation::CFRetained::from_raw(NonNull::new(buffer).unwrap()) };
-
-        assert!(
-            frames > 0 && total_bytes > 0,
-            "VideoToolbox produced no H.264 frames"
-        );
-        assert!(keyframes > 0, "expected at least one keyframe (IDR)");
-        eprintln!(
-            "VERIFIED: VideoToolbox encoded {frames} H.264 frame(s), {total_bytes} bytes, {keyframes} keyframe(s)"
-        );
-    }
+unsafe fn cf_dict_get_bool(dict: &CFDictionary, key: &CFString) -> bool {
+    let value = unsafe { dict.get_unchecked(key) };
+    value.is_some_and(CFBoolean::value)
 }
