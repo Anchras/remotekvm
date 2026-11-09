@@ -110,7 +110,7 @@ fn run_service_entry(config: ServiceConfig) -> Result<()> {
             }
             ServiceControl::SessionChange(param) => {
                 let _ = control_tx.send(ServiceEvent::SessionChange {
-                    session_id: param.session_id,
+                    session_id: param.notification.session_id,
                     reason: param.reason,
                 });
                 ServiceControlHandlerResult::NoError
@@ -336,7 +336,7 @@ impl SessionAgents {
             if agent.is_running() {
                 true
             } else {
-                info!(*session_id, "Windows session agent exited");
+                info!(session_id = *session_id, "Windows session agent exited");
                 false
             }
         });

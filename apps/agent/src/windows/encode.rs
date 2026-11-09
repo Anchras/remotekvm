@@ -5,7 +5,7 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
-use windows::core::{s, Interface, GUID, PCSTR};
+use windows::core::{s, Interface, GUID, PCSTR, VARIANT};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0,
@@ -17,7 +17,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFMediaBuffer, IMFSample, IMFTransform, IWMVideoForceKeyFrame, MFCreateMediaType,
+    eAVEncCommonRateControlMode_CBR, eAVEncH264VLevel3_1, eAVEncH264VProfile_ConstrainedBase,
+    CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
+    CODECAPI_AVEncVideoForceKeyFrame, CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate,
+    IMFMediaBuffer, IMFSample, IMFTransform, IWMVideoForceKeyFrame, MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx,
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive, MFSTARTUP_FULL,
     MFT_CATEGORY_VIDEO_ENCODER, MFT_ENUM_FLAG_ALL, MFT_MESSAGE_COMMAND_FLUSH,
@@ -25,8 +28,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_PROCESS_OUTPUT_STATUS_NEW_STREAMS, MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT,
-    MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_VERSION,
+    MF_LOW_LATENCY, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
+    MF_MT_MAJOR_TYPE, MF_MT_MPEG2_LEVEL, MF_MT_MPEG2_PROFILE, MF_MT_SUBTYPE, MF_VERSION,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
@@ -558,9 +561,9 @@ impl NvencState {
             anyhow::bail!("NVENC accepted input but produced no H.264 output");
         }
 
-        let output = ensure_annex_b(&output);
+        let output = crate::codec::ensure_annex_b(&output);
         Ok(EncodedFrame {
-            is_keyframe: annex_b_contains_idr(&output),
+            is_keyframe: crate::codec::annex_b_contains_idr(&output),
             data: output,
             timestamp,
             backend: EncoderBackendKind::Nvenc,
@@ -568,26 +571,30 @@ impl NvencState {
     }
 
     fn upload_nv12(&self, nv12: &[u8]) -> Result<()> {
-        let expected_len =
-            self.config.width as usize * self.config.height as usize * 3usize / 2usize;
-        if nv12.len() != expected_len {
-            anyhow::bail!(
-                "NV12 upload size mismatch: got {} bytes, expected {expected_len}",
-                nv12.len()
-            );
-        }
+        let planes = crate::codec::split_nv12(nv12, self.config.width, self.config.height)?;
         let resource: ID3D11Resource = self
             .input_texture
             .cast()
             .context("cast NVENC input texture to D3D11 resource")?;
+        // DXGI_FORMAT_NV12 is two subresources: Y (0) and interleaved UV (1).
+        // UpdateSubresource ignores DepthPitch for a 2D texture, so writing the
+        // packed buffer into subresource 0 leaves chroma uninitialized.
         unsafe {
             self.context.UpdateSubresource(
                 &resource,
                 0,
                 None,
-                nv12.as_ptr().cast(),
-                self.config.width,
-                nv12.len() as u32,
+                planes.y.as_ptr().cast(),
+                planes.y_row_pitch,
+                0,
+            );
+            self.context.UpdateSubresource(
+                &resource,
+                1,
+                None,
+                planes.uv.as_ptr().cast(),
+                planes.uv_row_pitch,
+                0,
             );
         }
         Ok(())
@@ -1458,13 +1465,30 @@ struct MediaFoundationState {
     frame_index: u64,
     requested_bitrate_kbps: u32,
     pending_keyframe: bool,
+    parameter_sets: crate::codec::H264ParameterSetCache,
+}
+
+// The Microsoft H.264 MFT is an MTA COM object. The windows crate does not
+// mark `IMFTransform` as Send, but this state only moves onto the encode task
+// and is touched while `MediaFoundationEncoder`'s mutex is held.
+unsafe impl Send for MediaFoundationState {}
+
+fn ensure_media_foundation() -> Result<()> {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    // MFStartup is process-refcounted. A racing second call is harmless, and
+    // the agent keeps Media Foundation alive for the process lifetime so a
+    // later encoder is not shut down out from under an earlier one.
+    unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL).context("start Media Foundation")? };
+    STARTED.store(true, Ordering::Release);
+    Ok(())
 }
 
 impl MediaFoundationEncoder {
     fn new(config: &EncoderConfig) -> Result<Self> {
-        unsafe {
-            MFStartup(MF_VERSION, MFSTARTUP_FULL).context("start Media Foundation")?;
-        }
+        ensure_media_foundation()?;
         let state = MediaFoundationState::new(config)?;
         Ok(Self {
             state: Mutex::new(state),
@@ -1534,11 +1558,20 @@ impl MediaFoundationState {
             frame_index: 0,
             requested_bitrate_kbps: config.bitrate_kbps,
             pending_keyframe: true,
+            parameter_sets: crate::codec::H264ParameterSetCache::default(),
         })
     }
 
-    fn recreate_if_needed(&mut self) -> Result<()> {
+    fn apply_bitrate(&mut self) -> Result<()> {
         if self.requested_bitrate_kbps == self.config.bitrate_kbps {
+            return Ok(());
+        }
+        if set_codec_u32(
+            &self.transform,
+            &CODECAPI_AVEncCommonMeanBitRate,
+            self.requested_bitrate_kbps.saturating_mul(1_000),
+        ) {
+            self.config.bitrate_kbps = self.requested_bitrate_kbps;
             return Ok(());
         }
 
@@ -1550,10 +1583,12 @@ impl MediaFoundationState {
         }
 
         self.config.bitrate_kbps = self.requested_bitrate_kbps;
+        let parameter_sets = self.parameter_sets.clone();
         let next = Self::new(&self.config).context("recreate Media Foundation encoder")?;
         self.transform = next.transform;
         self.output_provides_samples = next.output_provides_samples;
         self.output_buffer_size = next.output_buffer_size;
+        self.parameter_sets = parameter_sets;
         self.pending_keyframe = true;
         Ok(())
     }
@@ -1565,14 +1600,10 @@ impl MediaFoundationState {
     ) -> Result<EncodedFrame> {
         validate_frame(frame)?;
         self.requested_bitrate_kbps = params.bitrate_kbps;
-        self.recreate_if_needed()?;
+        self.apply_bitrate()?;
 
         if params.force_keyframe || self.pending_keyframe {
-            if let Ok(force_keyframe) = self.transform.cast::<IWMVideoForceKeyFrame>() {
-                unsafe {
-                    let _ = force_keyframe.SetKeyFrame();
-                }
-            }
+            force_media_foundation_keyframe(&self.transform);
             self.pending_keyframe = false;
         }
 
@@ -1594,8 +1625,9 @@ impl MediaFoundationState {
             anyhow::bail!("Media Foundation H.264 MFT accepted input but produced no output");
         }
 
-        output = ensure_annex_b(&output);
-        let is_keyframe = annex_b_contains_idr(&output);
+        output = crate::codec::ensure_annex_b(&output);
+        output = crate::codec::with_parameter_sets_before_idr(&mut self.parameter_sets, &output);
+        let is_keyframe = crate::codec::annex_b_contains_idr(&output);
 
         Ok(EncodedFrame {
             data: output,
@@ -1726,7 +1758,16 @@ fn configure_h264_transform(transform: &IMFTransform, config: &EncoderConfig) ->
     unsafe {
         output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         output_type.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-        output_type.SetUINT32(&MF_MT_AVG_BITRATE, config.bitrate_kbps * 1_000)?;
+        output_type.SetUINT32(
+            &MF_MT_AVG_BITRATE,
+            config.bitrate_kbps.saturating_mul(1_000),
+        )?;
+        output_type.SetUINT32(
+            &MF_MT_MPEG2_PROFILE,
+            eAVEncH264VProfile_ConstrainedBase.0 as u32,
+        )?;
+        output_type.SetUINT32(&MF_MT_MPEG2_LEVEL, eAVEncH264VLevel3_1.0 as u32)?;
+        output_type.SetUINT32(&MF_LOW_LATENCY, 1)?;
         output_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
         output_type.SetUINT64(
             &MF_MT_FRAME_SIZE,
@@ -1753,7 +1794,48 @@ fn configure_h264_transform(transform: &IMFTransform, config: &EncoderConfig) ->
             .context("set Media Foundation NV12 input type")?;
     }
 
+    // ICodecAPI is optional. Hardware MFTs that reject it still encode; the
+    // media-type attributes above remain the baseline configuration.
+    let _ = set_codec_u32(
+        transform,
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+    );
+    let _ = set_codec_u32(
+        transform,
+        &CODECAPI_AVEncCommonMeanBitRate,
+        config.bitrate_kbps.saturating_mul(1_000),
+    );
+    let _ = set_codec_bool(transform, &CODECAPI_AVLowLatencyMode, true);
+
     Ok(())
+}
+
+fn force_media_foundation_keyframe(transform: &IMFTransform) {
+    if set_codec_bool(transform, &CODECAPI_AVEncVideoForceKeyFrame, true) {
+        return;
+    }
+    if let Ok(force_keyframe) = transform.cast::<IWMVideoForceKeyFrame>() {
+        unsafe {
+            let _ = force_keyframe.SetKeyFrame();
+        }
+    }
+}
+
+fn set_codec_u32(transform: &IMFTransform, key: &GUID, value: u32) -> bool {
+    let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
+        return false;
+    };
+    let variant = VARIANT::from(value);
+    unsafe { codec_api.SetValue(key, &variant).is_ok() }
+}
+
+fn set_codec_bool(transform: &IMFTransform, key: &GUID, value: bool) -> bool {
+    let Ok(codec_api) = transform.cast::<ICodecAPI>() else {
+        return false;
+    };
+    let variant = VARIANT::from(value);
+    unsafe { codec_api.SetValue(key, &variant).is_ok() }
 }
 
 fn pack_u32_pair(high: u32, low: u32) -> u64 {
@@ -1887,66 +1969,6 @@ fn encoded_buffer_size(config: &EncoderConfig) -> u32 {
     (config.width as usize * config.height as usize * 4).min(u32::MAX as usize) as u32
 }
 
-fn ensure_annex_b(data: &[u8]) -> Vec<u8> {
-    if has_annex_b_start_code(data) {
-        return data.to_vec();
-    }
-
-    let mut offset = 0;
-    let mut out = Vec::with_capacity(data.len() + 16);
-    while offset + 4 <= data.len() {
-        let nalu_len = u32::from_be_bytes([
-            data[offset],
-            data[offset + 1],
-            data[offset + 2],
-            data[offset + 3],
-        ]) as usize;
-        offset += 4;
-        if nalu_len == 0 || offset + nalu_len > data.len() {
-            return data.to_vec();
-        }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&data[offset..offset + nalu_len]);
-        offset += nalu_len;
-    }
-
-    if offset == data.len() && !out.is_empty() {
-        out
-    } else {
-        data.to_vec()
-    }
-}
-
-fn has_annex_b_start_code(data: &[u8]) -> bool {
-    data.windows(3).any(|w| w == [0, 0, 1]) || data.windows(4).any(|w| w == [0, 0, 0, 1])
-}
-
-fn annex_b_contains_idr(data: &[u8]) -> bool {
-    annex_b_nalu_types(data).any(|nalu_type| nalu_type == 5 || nalu_type == 7)
-}
-
-fn annex_b_nalu_types(data: &[u8]) -> impl Iterator<Item = u8> + '_ {
-    let mut offset = 0;
-    std::iter::from_fn(move || {
-        while offset + 4 <= data.len() {
-            let start_len = if data[offset..].starts_with(&[0, 0, 0, 1]) {
-                4
-            } else if data[offset..].starts_with(&[0, 0, 1]) {
-                3
-            } else {
-                offset += 1;
-                continue;
-            };
-            offset += start_len;
-            if offset < data.len() {
-                let nalu_type = data[offset] & 0x1f;
-                return Some(nalu_type);
-            }
-        }
-        None
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1967,13 +1989,8 @@ mod tests {
 
         let nv12 = bgra_to_nv12(&frame).unwrap();
         assert_eq!(nv12.len(), 6);
-    }
-
-    #[test]
-    fn converts_avcc_lengths_to_annex_b() {
-        let avcc = [0, 0, 0, 2, 0x65, 0x88, 0, 0, 0, 2, 0x41, 0x99];
-        let annex_b = ensure_annex_b(&avcc);
-        assert_eq!(&annex_b[..4], &[0, 0, 0, 1]);
-        assert!(annex_b_contains_idr(&annex_b));
+        let planes = crate::codec::split_nv12(&nv12, frame.width, frame.height).unwrap();
+        assert_eq!(planes.y.len(), 4);
+        assert_eq!(planes.uv.len(), 2);
     }
 }

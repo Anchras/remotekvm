@@ -1265,7 +1265,7 @@ mod platform {
 
         use anyhow::{anyhow, Context, Result};
         use bytes::Bytes;
-        use windows::core::{Interface, GUID};
+        use windows::core::GUID;
         use windows::Win32::Media::MediaFoundation::{
             IMFActivate, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFCreateMediaType,
             MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx,
@@ -1399,8 +1399,14 @@ mod platform {
                             if let Some(sample) = sample {
                                 frames.push(self.copy_output_sample(&sample)?);
                             }
-                            if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 == 0 {
-                                continue;
+                            // Drain until NEED_MORE_INPUT. INCOMPLETE means this
+                            // buffer did not hold the whole sample; a complete
+                            // buffer can still be followed by another frame.
+                            // Either flag keeps the loop going.
+                            if output.dwStatus & MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.0 as u32 != 0 {
+                                tracing::trace!(
+                                    "Media Foundation decoder output buffer is incomplete"
+                                );
                             }
                         }
                         Err(error) if error.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,

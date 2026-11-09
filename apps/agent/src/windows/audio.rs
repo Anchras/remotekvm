@@ -535,17 +535,19 @@ impl WasapiFormat {
         }
 
         let wave = *format;
+        // WAVEFORMATEX is packed. Copy fields out before formatting them.
         let tag = wave.wFormatTag as u32;
+        let bits_per_sample = wave.wBitsPerSample;
         let sample_format = match tag {
-            WAVE_FORMAT_PCM => match wave.wBitsPerSample {
+            WAVE_FORMAT_PCM => match bits_per_sample {
                 16 => SampleFormat::Pcm16,
                 24 => SampleFormat::Pcm24,
                 32 => SampleFormat::Pcm32,
                 bits => anyhow::bail!("unsupported PCM bit depth: {bits}"),
             },
             WAVE_FORMAT_IEEE_FLOAT => {
-                if wave.wBitsPerSample != 32 {
-                    anyhow::bail!("unsupported float bit depth: {}", wave.wBitsPerSample);
+                if bits_per_sample != 32 {
+                    anyhow::bail!("unsupported float bit depth: {bits_per_sample}");
                 }
                 SampleFormat::Float32
             }
@@ -553,18 +555,15 @@ impl WasapiFormat {
                 let extensible = format as *const WAVEFORMATEXTENSIBLE;
                 let sub_format = std::ptr::addr_of!((*extensible).SubFormat).read_unaligned();
                 if sub_format == KSDATAFORMAT_SUBTYPE_PCM {
-                    match wave.wBitsPerSample {
+                    match bits_per_sample {
                         16 => SampleFormat::Pcm16,
                         24 => SampleFormat::Pcm24,
                         32 => SampleFormat::Pcm32,
                         bits => anyhow::bail!("unsupported extensible PCM bit depth: {bits}"),
                     }
                 } else if sub_format == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
-                    if wave.wBitsPerSample != 32 {
-                        anyhow::bail!(
-                            "unsupported extensible float bit depth: {}",
-                            wave.wBitsPerSample
-                        );
+                    if bits_per_sample != 32 {
+                        anyhow::bail!("unsupported extensible float bit depth: {bits_per_sample}");
                     }
                     SampleFormat::Float32
                 } else {
