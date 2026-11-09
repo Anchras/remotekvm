@@ -8,8 +8,8 @@
 //   - macOS: signaling + control channel + input injection work today; with
 //     `--features macos_v0`, ScreenCaptureKit/VideoToolbox publishes H.264
 //     samples to an advertised WebRTC video track.
-//   - Windows: service/controller scaffolding, WASAPI audio, and H.264 video
-//     pipeline boundaries are in place.
+//   - Windows: DXGI capture, NVENC with a Media Foundation H.264 fallback,
+//     WASAPI audio, and SendInput are wired into the WebRTC session.
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,6 +20,8 @@ use remotekvm_transport::PeerSession;
 
 #[cfg(target_os = "windows")]
 mod windows;
+
+mod codec;
 
 #[cfg(all(target_os = "macos", feature = "macos_v0"))]
 mod macos;
